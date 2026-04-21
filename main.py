@@ -109,7 +109,6 @@ console: Console = Console(theme=custom_theme)
 def _short_cwd(cwd: str) -> str:
     """
     Return the last two path components of cwd joined by the OS separator.
-    e.g. /home/user/projects/Soda/Src  ->  Soda\\Src  (Windows-style shown here)
     """
     parts: list[str] = Path(cwd).parts
     if len(parts) <= 2:
@@ -118,11 +117,6 @@ def _short_cwd(cwd: str) -> str:
 
 
 # ── Session persistence ─────────────────────────────────────────────────────────────
-#
-# One JSON file per working directory, stored in SESSION_DIR.
-# On startup the session for the launch cwd is loaded automatically.
-# /cd saves the current session and loads the one for the new directory.
-
 
 def _session_path(cwd: str) -> Path:
     safe: str = re.sub(r"[^\w.\-]", "_", cwd)
@@ -182,7 +176,6 @@ def _index_path(vc_slot: Path) -> Path:
     return vc_slot / "index.json"
 
 
-# commit_log maps filepath -> list of {"snapshot": str, "message": str, "timestamp": str}
 commit_log: dict[str, list[dict]] = defaultdict(list)
 
 
@@ -216,7 +209,6 @@ def _load_index(filepath: str) -> None:
 # ── Named commit helpers ──────────────────────────────────────────────────────────
 
 def do_commit(filepath: str, message: str) -> None:
-    """Save the current file state as a named commit."""
     path: Path = Path(filepath)
     if not path.exists():
         console.print(f"[error]File not found: {filepath}[/error]")
@@ -245,7 +237,6 @@ def do_commit(filepath: str, message: str) -> None:
 
 
 def show_log(filepath: str) -> None:
-    """Show the named commit log for a file."""
     _load_index(filepath)
     entries: list[dict] = commit_log[filepath]
 
@@ -269,7 +260,6 @@ def show_log(filepath: str) -> None:
 
 
 def do_restore(filepath: str, idx_str: str) -> None:
-    """Restore a file to a specific commit index."""
     _load_index(filepath)
     entries: list[dict] = commit_log[filepath]
 
@@ -280,7 +270,7 @@ def do_restore(filepath: str, idx_str: str) -> None:
     try:
         idx: int = int(idx_str)
     except ValueError:
-        console.print(f"[error]Index must be a number. Run /log {filepath} to see commit indices.[/error]")
+        console.print(f"[error]Index must be a number.[/error]")
         return
 
     if idx < 0 or idx >= len(entries):
@@ -292,7 +282,6 @@ def do_restore(filepath: str, idx_str: str) -> None:
         console.print(f"[error]Snapshot file missing for commit #{idx}.[/error]")
         return
 
-    # Push current state onto the undo stack before overwriting
     path: Path = Path(filepath)
     if path.exists():
         current_bak: Path = _snapshot(filepath, path.read_text(encoding="utf-8"))
@@ -315,10 +304,8 @@ def do_restore(filepath: str, idx_str: str) -> None:
 
 def _all_tracked_files() -> list[str]:
     result: list[str] = []
-
     if not VC_DIR.exists():
         return result
-
     for slot in sorted(VC_DIR.iterdir()):
         idx: Path = slot / "index.json"
         if idx.exists():
@@ -329,7 +316,6 @@ def _all_tracked_files() -> list[str]:
                     result.append(fp)
             except Exception:
                 pass
-
     return result
 
 
@@ -364,7 +350,6 @@ def write_file_with_vc(filepath: str, new_content: str) -> None:
 
 def do_undo(filepath: str) -> None:
     _load_index(filepath)
-
     if not undo_stack[filepath]:
         console.print(f"[error]Nothing to undo for {filepath}[/error]")
         return
@@ -389,7 +374,6 @@ def do_undo(filepath: str) -> None:
 
 def do_redo(filepath: str) -> None:
     _load_index(filepath)
-
     if not redo_stack[filepath]:
         console.print(f"[error]Nothing to redo for {filepath}[/error]")
         return
@@ -413,7 +397,6 @@ def do_redo(filepath: str) -> None:
 
 def show_file_history(filepath: str) -> None:
     _load_index(filepath)
-
     undo_baks: list[Path] = undo_stack[filepath]
     redo_baks: list[Path] = redo_stack[filepath]
 
@@ -426,15 +409,13 @@ def show_file_history(filepath: str) -> None:
         ts: str   = bak.stem.replace("_", " ", 2)
         size: int = bak.stat().st_size
         rows.append(f"  undo[{i}]  {ts}  ({size} bytes)  {bak.name}")
-
     for i, bak in enumerate(redo_baks):
         ts   = bak.stem.replace("_", " ", 2)
         size = bak.stat().st_size
         rows.append(f"  redo[{i}]  {ts}  ({size} bytes)  {bak.name}")
 
-    body: str = "\n".join(rows)
     console.print(Panel(
-        f"[info]{body}[/info]",
+        "[info]" + "\n".join(rows) + "[/info]",
         title=f"History: {filepath}",
         border_style=SAKURA,
     ))
@@ -452,11 +433,7 @@ def read_file(path: str) -> str:
 def run_command(cmd: str) -> str:
     try:
         result: subprocess.CompletedProcess = subprocess.run(
-            cmd,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
+            cmd, shell=True, capture_output=True, text=True, timeout=30,
         )
         output: str = result.stdout + result.stderr
         return output.strip() or "(no output)"
@@ -474,12 +451,10 @@ def build_context_snippet(cwd: str) -> str:
         ][:20]
     except Exception:
         files = []
-
-    lines: list[str] = [
+    return "\n".join([
         f"Working directory: {cwd}",
         f"Visible files: {', '.join(files) if files else 'none'}",
-    ]
-    return "\n".join(lines)
+    ])
 
 
 def resolve_path(arg: str, cwd: str) -> str:
@@ -490,14 +465,11 @@ def resolve_path(arg: str, cwd: str) -> str:
 
 
 # ── Partial-write detection ──────────────────────────────────────────────────────────────
-#
-# Patterns that indicate the model gave a truncated / partial file rather than
-# writing the whole thing.
 
 _PARTIAL_PATTERNS: list[re.Pattern] = [
-    re.compile(r"^\s*\.{3}\s*$",                       re.MULTILINE),  # lone ...
-    re.compile(r"^\s*#\s*\.{3}\s*$",                   re.MULTILINE),  # # ...
-    re.compile(r"^\s*//\s*\.{3}\s*$",                  re.MULTILINE),  # // ...
+    re.compile(r"^\s*\.{3}\s*$",                       re.MULTILINE),
+    re.compile(r"^\s*#\s*\.{3}\s*$",                   re.MULTILINE),
+    re.compile(r"^\s*//\s*\.{3}\s*$",                  re.MULTILINE),
     re.compile(r"#\s*(rest|remainder|remaining)\s+of",  re.IGNORECASE),
     re.compile(r"#\s*\.\.\.\.*",                        re.IGNORECASE),
     re.compile(r"//\s*\.\.\.\.*",                       re.IGNORECASE),
@@ -510,9 +482,6 @@ _PARTIAL_PATTERNS: list[re.Pattern] = [
 
 
 def _reply_has_partial_write(reply: str) -> bool:
-    """
-    Return True if the reply contains a WRITE block whose code looks truncated.
-    """
     for match in _WRITE_PATTERN.finditer(reply):
         code: str = match.group("code")
         for pat in _PARTIAL_PATTERNS:
@@ -544,17 +513,7 @@ _RUN_PATTERN: re.Pattern = re.compile(
 )
 
 
-def apply_command_runs(
-    reply: str,
-    cwd: str,
-    messages: list[dict],
-) -> None:
-    """
-    Scan `reply` for <!-- RUN: cmd --> markers.  For each one found, show the
-    command to the user and ask for y/n confirmation before running it.
-    The output is printed and injected back into the conversation as a user
-    message so the model can react to it.
-    """
+def apply_command_runs(reply: str, cwd: str, messages: list[dict]) -> None:
     for match in _RUN_PATTERN.finditer(reply):
         cmd: str = match.group("cmd").strip()
         if not cmd:
@@ -576,21 +535,13 @@ def apply_command_runs(
 
         if answer not in ("y", "yes"):
             console.print("[info]Command skipped.[/info]")
-            # Still tell the model it was denied so it can adjust
-            messages.append({
-                "role": "user",
-                "content": f"[Command `{cmd}` was denied by the user.]",
-            })
+            messages.append({"role": "user", "content": f"[Command `{cmd}` was denied by the user.]"})
             continue
 
         console.print(f"[info]Running: {cmd}[/info]")
         output: str = run_command(cmd)
         console.print(Panel(output, title=f"$ {cmd}", border_style=SAKURA_MUTED))
-
-        messages.append({
-            "role": "user",
-            "content": f"[Command `{cmd}` was run. Output:]\n```\n{output}\n```",
-        })
+        messages.append({"role": "user", "content": f"[Command `{cmd}` was run. Output:]\n```\n{output}\n```"})
 
 
 # ── Tab-completion (prompt_toolkit) ────────────────────────────────────────────────
@@ -610,12 +561,10 @@ _CMD_SUBARGS: dict[str, list[str]] = {
     "/read":  ["-a"],
 }
 
-# Commands whose second token is a file/directory path
 _FILE_COMMANDS: set[str] = {"/read", "/check", "/undo", "/redo", "/files", "/cd", "/commit", "/log", "/restore"}
 
 
 def _fuzzy_match(query: str, candidate: str) -> bool:
-    """Return True if every char of query appears in order in candidate (case-insensitive)."""
     q: str = query.lower()
     c: str = candidate.lower()
     qi: int = 0
@@ -627,14 +576,11 @@ def _fuzzy_match(query: str, candidate: str) -> bool:
 
 if _PT_AVAILABLE:
     class _SlashCompleter(Completer):  # type: ignore[misc]
-        """Tab-completer for slash commands, sub-args, and file paths."""
-
         def __init__(self, cwd_getter):
             self._cwd = cwd_getter
 
         def get_completions(self, document, complete_event):
             text: str = document.text_before_cursor
-
             if not text.startswith("/"):
                 return
 
@@ -642,23 +588,16 @@ if _PT_AVAILABLE:
             typed_cmd: str   = parts[0]
             is_exact: bool   = typed_cmd.lower() in {c.lower() for c in _SLASH_COMMANDS}
 
-            # ── Command name completion ──────────────────────────────────────────
-            # Fire when: (a) still typing the command (no space yet), or
-            # (b) typed a space but the token before it isn't an exact command
-            #     (e.g. "/stack ") — we're still resolving the command.
             if len(parts) == 1 or not is_exact:
                 typed: str = typed_cmd
                 for cmd in _SLASH_COMMANDS:
                     if cmd.startswith(typed) or _fuzzy_match(typed, cmd):
-                        # Replace the entire text so far (including any trailing space)
                         yield Completion(cmd, start_position=-len(text.rstrip()))
                 return
 
-            # ── Argument completion (exact command already typed) ─────────────────
             cmd: str        = typed_cmd.lower()
             arg_so_far: str = parts[1]
 
-            # Sub-command completions (e.g. /stackview <tab>)
             if cmd in _CMD_SUBARGS:
                 for sub in _CMD_SUBARGS[cmd]:
                     if sub.lower().startswith(arg_so_far.lower()) or (
@@ -666,15 +605,11 @@ if _PT_AVAILABLE:
                     ):
                         yield Completion(sub, start_position=-len(arg_so_far))
 
-            # File/directory completions for file-taking commands
-            # Skip file completions when the argument is a flag like -a
             if cmd in _FILE_COMMANDS and not arg_so_far.startswith("-"):
                 cwd: str = self._cwd()
                 try:
                     base: Path = Path(cwd)
-
-                    # Determine search directory and fragment to match
-                    sep: str = "/"  # always use / for splitting typed paths
+                    sep: str = "/"
                     if sep in arg_so_far:
                         prefix: str    = arg_so_far[: arg_so_far.rfind(sep) + 1]
                         fragment: str  = arg_so_far[arg_so_far.rfind(sep) + 1 :]
@@ -691,10 +626,7 @@ if _PT_AVAILABLE:
                         if entry.name.lower().startswith(fragment.lower()) or (
                             fragment and _fuzzy_match(fragment, entry.name)
                         ):
-                            yield Completion(
-                                prefix + tail,
-                                start_position=-len(arg_so_far),
-                            )
+                            yield Completion(prefix + tail, start_position=-len(arg_so_far))
                 except Exception:
                     pass
 
@@ -703,9 +635,11 @@ if _PT_AVAILABLE:
 
 def _get_fuzzy_completions(text: str, cwd: str) -> list[str]:
     """
-    Return a list of candidate completion strings for the current input.
-    - Partial command → matching command names
-    - Exact command + space → sub-arg or file hint
+    Return hint completion strings for the current input.
+
+    Key rule for path-bearing commands like /cd:
+    The hint always preserves whatever prefix the user typed
+    (e.g. "../") rather than resolving it to an absolute path.
     """
     if not text.startswith("/"):
         return []
@@ -732,32 +666,36 @@ def _get_fuzzy_completions(text: str, cwd: str) -> list[str]:
                 results.append(f"{typed_cmd} {sub}")
 
     if not results and cmd in _FILE_COMMANDS and not arg_so_far.startswith("-"):
-        # For /cd, enumerate subdirectories of the path typed so far
         if cmd == "/cd":
             try:
-                # Work out which directory to list and what fragment to match
-                if arg_so_far:
-                    candidate: Path = Path(arg_so_far) if Path(arg_so_far).is_absolute() else Path(cwd) / arg_so_far
-                    if candidate.is_dir():
-                        # arg_so_far is already a complete dir — list its children
-                        search_dir: Path = candidate.resolve()
-                        fragment: str    = ""
-                        prefix: str      = arg_so_far.rstrip("/\\") + "/"
-                    else:
-                        # arg_so_far is a partial name — list parent, match fragment
-                        search_dir = candidate.parent.resolve()
-                        fragment   = candidate.name
-                        prefix     = str(candidate.parent).rstrip("/\\") + "/" if str(candidate.parent) not in (".", cwd) else ""
+                # ── Derive prefix and fragment from the typed string only.
+                # Never use str(Path.parent) -- that resolves '..' to an
+                # absolute path and produces ugly/long completions.
+                # Instead, split on the last separator character in the
+                # typed argument to get the literal directory prefix.
+                arg = arg_so_far
+                last_sep = max(arg.rfind("/"), arg.rfind("\\"))
+                if last_sep >= 0:
+                    # e.g. arg = "../Soda" -> prefix="../", fragment="Soda"
+                    typed_prefix: str = arg[: last_sep + 1]
+                    fragment: str     = arg[last_sep + 1 :]
+                else:
+                    typed_prefix = ""
+                    fragment     = arg
+
+                # Resolve the directory to list (for os.iterdir), but
+                # we only use this for the filesystem scan, NOT for the hint text.
+                if typed_prefix:
+                    search_dir: Path = (Path(cwd) / typed_prefix).resolve()
                 else:
                     search_dir = Path(cwd).resolve()
-                    fragment   = ""
-                    prefix     = ""
 
                 for entry in sorted(search_dir.iterdir()):
                     if not entry.is_dir() or entry.name.startswith("."):
                         continue
                     if not fragment or entry.name.lower().startswith(fragment.lower()) or _fuzzy_match(fragment, entry.name):
-                        results.append(f"{typed_cmd} {prefix}{entry.name}")
+                        # Hint text uses the typed prefix, not the resolved path.
+                        results.append(f"{typed_cmd} {typed_prefix}{entry.name}")
                         if len(results) >= 7:
                             break
             except Exception:
@@ -769,10 +707,6 @@ def _get_fuzzy_completions(text: str, cwd: str) -> list[str]:
 
 
 def _enable_windows_vt() -> None:
-    """
-    Enable ANSI virtual-terminal processing on Windows stdout.
-    Safe no-op on non-Windows or if the handle is not a real console.
-    """
     if sys.platform != "win32":
         return
     try:
@@ -790,20 +724,12 @@ def _enable_windows_vt() -> None:
 
 def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
     """
-    Character-by-character prompt that renders fuzzy hint candidates on the
-    line immediately above the input.
-
-    Layout (two terminal lines):
-        [hint line]   /stackview  /stack  /check …
-        [prompt line] you (dir): /sta_
+    Character-by-character prompt with fuzzy hint line above the input.
 
     On Windows the hint/prompt pair is redrawn using Win32
     SetConsoleCursorPosition so cursor movement is reliable regardless of
     whether the terminal honours ANSI escape sequences.  On Unix the
-    existing ANSI approach is used (it works fine there).
-
-    Tab completes to the first candidate.  Up/Down arrows browse history.
-    Falls back to plain input() if terminal control fails.
+    existing ANSI approach is used.
     """
     _enable_windows_vt()
 
@@ -840,18 +766,9 @@ def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
             best += " "
         return best
 
-    # ───────────────────────────────────────────────────────────────────────
-    # Platform-specific _render implementation
-    # ───────────────────────────────────────────────────────────────────────
+    # ── Platform-specific render ──────────────────────────────────────────────
 
     if sys.platform == "win32":
-        # ── Windows: use SetConsoleCursorPosition for reliable cursor movement ──
-        #
-        # ANSI cursor-up (\033[1A) is unreliable through Python stdout on many
-        # Windows console hosts even when VT processing is enabled.  Instead we
-        # record the Y coordinate of the hint row right after the initial print
-        # and jump back to it directly via Win32 API on every keystroke.
-
         import ctypes        # type: ignore[import]
         import ctypes.wintypes  # type: ignore[import]
 
@@ -874,7 +791,7 @@ def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
             ]
 
         _k32  = ctypes.windll.kernel32   # type: ignore[attr-defined]
-        _hout = _k32.GetStdHandle(-11)   # STD_OUTPUT_HANDLE
+        _hout = _k32.GetStdHandle(-11)
 
         def _cur_y() -> int:
             csbi = _CSBI()
@@ -884,49 +801,35 @@ def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
         def _goto(x: int, y: int) -> None:
             _k32.SetConsoleCursorPosition(_hout, _COORD(x, y))
 
-        # Print blank hint line then prompt; record the hint row's Y.
         sys.stdout.write("\n" + prompt_str)
         sys.stdout.flush()
         _prompt_y: int = _cur_y()
-        _hint_y: list[int] = [_prompt_y - 1]   # mutable ref for closure
+        _hint_y: list[int] = [_prompt_y - 1]
 
         def _render(text: str) -> None:
-            hint: str       = _hint_line(text)
-            hint_plain: str = re.sub(r"\033\[[^m]*m", "", hint)
-            term_width: int = console.width or 80
-
-            # Rewrite hint row: jump to col 0, print hint + erase to EOL.
+            hint: str = _hint_line(text)
             _goto(0, _hint_y[0])
-            # \033[K = erase from cursor to end of line (works after goto)
             sys.stdout.write(hint + "\033[K")
-
-            # Rewrite prompt row: jump to col 0, print prompt + typed text + erase to EOL.
             _goto(0, _hint_y[0] + 1)
             sys.stdout.write(prompt_str + text + "\033[K")
             sys.stdout.flush()
 
     else:
-        # ── Unix: ANSI cursor-up works reliably ──────────────────────────────
         prev_hint_lines: list[int] = [1]
-
-        # Print blank hint line + prompt so _render has two lines to work with.
         sys.stdout.write(f"\n{prompt_str}")
         sys.stdout.flush()
 
         def _render(text: str) -> None:  # type: ignore[misc]
             hint: str       = _hint_line(text)
             term_width: int = console.width or 80
-
             hint_plain: str     = re.sub(r"\033\[[^m]*m", "", hint)
             new_hint_lines: int = max(1, -(-len(hint_plain) // term_width)) if hint_plain else 1
-
             clear_seq: str = "\033[1A\033[2K" * prev_hint_lines[0]
             prev_hint_lines[0] = new_hint_lines
-
             sys.stdout.write(f"{clear_seq}{hint}\n\033[2K{prompt_str}{text}")
             sys.stdout.flush()
 
-    # ── Input loop (shared for both platforms) ─────────────────────────────
+    # ── Input loop ────────────────────────────────────────────────────────────
 
     try:
         if sys.platform == "win32":
@@ -935,7 +838,7 @@ def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
             while True:
                 ch: str = msvcrt.getwch()  # type: ignore[attr-defined]
 
-                if ch in ("\x00", "\xe0"):  # extended / special key
+                if ch in ("\x00", "\xe0"):
                     ch2: str = msvcrt.getwch()  # type: ignore[attr-defined]
                     if ch2 == "H":   # up arrow
                         if hist_idx > 0:
@@ -951,25 +854,24 @@ def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
                     continue
 
                 if ch in ("\r", "\n"):
-                    # Move past the prompt line before returning.
                     _goto(0, _hint_y[0] + 1)
                     sys.stdout.write("\n")
                     sys.stdout.flush()
                     break
-                elif ch == "\x03":   # Ctrl+C
+                elif ch == "\x03":
                     _goto(0, _hint_y[0] + 1)
                     sys.stdout.write("\n")
                     sys.stdout.flush()
                     raise KeyboardInterrupt
-                elif ch == "\x04":   # Ctrl+D
+                elif ch == "\x04":
                     _goto(0, _hint_y[0] + 1)
                     sys.stdout.write("\n")
                     sys.stdout.flush()
                     raise EOFError
-                elif ch in ("\x08", "\x7f"):  # Backspace
+                elif ch in ("\x08", "\x7f"):
                     if buf:
                         buf.pop()
-                elif ch == "\t":      # Tab
+                elif ch == "\t":
                     buf[:] = list(_tab_complete(_text()))
                 else:
                     buf.append(ch)
@@ -1006,15 +908,15 @@ def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
                             buf.pop()
                     elif raw == b"\t":
                         buf[:] = list(_tab_complete(_text()))
-                    elif raw == b"\x1b":           # escape sequence
+                    elif raw == b"\x1b":
                         rest: bytes = os.read(fd, 2)
-                        if rest == b"[A":           # up arrow
+                        if rest == b"[A":
                             if hist_idx > 0:
                                 if hist_idx == len(history):
                                     saved_buf = buf[:]
                                 hist_idx -= 1
                                 buf[:] = list(history[hist_idx])
-                        elif rest == b"[B":         # down arrow
+                        elif rest == b"[B":
                             if hist_idx < len(history):
                                 hist_idx += 1
                                 buf[:] = list(
@@ -1034,15 +936,13 @@ def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
     except (KeyboardInterrupt, EOFError):
         raise
     except Exception:
-        # If anything goes wrong with raw-mode, fall back to plain input
         return input(prompt_str)
 
     return _text()
 
 
-# ── /check helpers ──────────────────────────────────────────────────────────────────
+# ── /check helpers ─────────────────────────────────────────────────────────────────
 
-# Extensions treated as source code (used for /check ALL)
 _CODE_EXTENSIONS: set[str] = {
     ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs",
     ".c", ".cpp", ".h", ".hpp", ".java", ".kt", ".swift",
@@ -1052,14 +952,6 @@ _CODE_EXTENSIONS: set[str] = {
 
 
 def _extract_function(source: str, func_name: str) -> str | None:
-    """
-    Extract the source of a named function/method from `source`.
-    Supports Python (def), JS/TS (function / arrow / method), and a generic
-    brace-counting fallback for C-family languages.
-
-    Returns the function source string, or None if not found.
-    """
-    # ── Python: def func_name(...): ──────────────────────────────────────────────────
     py_pat = re.compile(
         rf"^([ \t]*)(async\s+)?def\s+{re.escape(func_name)}\s*\(",
         re.MULTILINE,
@@ -1071,7 +963,6 @@ def _extract_function(source: str, func_name: str) -> str | None:
         lines: list[str] = source[start:].splitlines(keepends=True)
         body: list[str]  = [lines[0]]
         for line in lines[1:]:
-            # Stop at next definition at same or lower indent level
             if line.strip() and not line.startswith("\t") and indent == "":
                 stripped: str = line.lstrip()
                 if re.match(r"(async\s+)?def |class ", stripped):
@@ -1080,12 +971,10 @@ def _extract_function(source: str, func_name: str) -> str | None:
                 if re.match(r"[ \t]*(async\s+)?def |[ \t]*class ", line):
                     break
             body.append(line)
-        # Trim trailing blank lines
         while body and not body[-1].strip():
             body.pop()
         return "".join(body)
 
-    # ── JS/TS: function funcName(...) / async function / arrow / method ──────────────
     js_pat = re.compile(
         rf"(?:(?:async\s+)?function\s+{re.escape(func_name)}|(?:const|let|var)\s+{re.escape(func_name)}\s*=|[\s,{{]\s*{re.escape(func_name)}\s*(?:\([^)]*\)\s*=>|\([^)]*\)\s*\{{))",
         re.MULTILINE,
@@ -1093,7 +982,6 @@ def _extract_function(source: str, func_name: str) -> str | None:
     m = js_pat.search(source)
     if m:
         start = m.start()
-        # Brace counting from the first '{'
         brace_start: int = source.find("{", start)
         if brace_start != -1:
             depth: int  = 0
@@ -1108,7 +996,6 @@ def _extract_function(source: str, func_name: str) -> str | None:
                         break
             return source[start:end]
 
-    # ── Generic brace-count fallback ─────────────────────────────────────────────────
     generic_pat = re.compile(
         rf"[\w\s*&]*\b{re.escape(func_name)}\s*\([^)]*\)\s*[{{]",
         re.MULTILINE,
@@ -1133,7 +1020,6 @@ def _extract_function(source: str, func_name: str) -> str | None:
 
 
 def _build_check_prompt(label: str, code: str, scope: str) -> str:
-    """Build the AI review prompt for /check."""
     return (
         f"Please review the following {scope} for bugs, logic errors, "
         f"potential runtime exceptions, bad practices, and security issues.\n"
@@ -1146,11 +1032,9 @@ def _build_check_prompt(label: str, code: str, scope: str) -> str:
 
 
 def handle_check(arg: str, messages: list[dict], state: dict) -> None:
-    """Dispatch /check <target>."""
-    cwd: str  = state["cwd"]
+    cwd: str       = state["cwd"]
     arg_clean: str = arg.strip()
 
-    # ── /check ALL ────────────────────────────────────────────────────────────────────
     if arg_clean.upper() == "ALL":
         try:
             source_files: list[Path] = [
@@ -1167,7 +1051,6 @@ def handle_check(arg: str, messages: list[dict], state: dict) -> None:
             console.print(f"[info]No source files found in {cwd}.[/info]")
             return
 
-        # Build combined snippet (cap at ~400 KB to avoid context overflow)
         parts: list[str] = []
         total_chars: int = 0
         skipped: list[str] = []
@@ -1189,18 +1072,12 @@ def handle_check(arg: str, messages: list[dict], state: dict) -> None:
                 + (" ..." if len(skipped) > 5 else "") + "[/info]"
             )
 
-        combined: str = "\n\n".join(parts)
+        combined: str   = "\n\n".join(parts)
         file_count: int = len(parts)
-        console.print(
-            f"[info]Checking {file_count} file(s) in {_short_cwd(cwd)}...[/info]"
-        )
-        prompt: str = _build_check_prompt(
-            f"{file_count} file(s) in {cwd}", combined, "workspace"
-        )
+        console.print(f"[info]Checking {file_count} file(s) in {_short_cwd(cwd)}...[/info]")
+        prompt: str = _build_check_prompt(f"{file_count} file(s) in {cwd}", combined, "workspace")
 
-    # ── /check file.py:funcName ───────────────────────────────────────────────────────
     elif ":" in arg_clean and not arg_clean.startswith(":"):
-        # Split on the LAST colon so Windows paths (C:\...) are handled
         last_colon: int  = arg_clean.rfind(":")
         file_part: str   = arg_clean[:last_colon]
         func_name: str   = arg_clean[last_colon + 1:].strip().rstrip("()")
@@ -1214,29 +1091,22 @@ def handle_check(arg: str, messages: list[dict], state: dict) -> None:
         func_src: str | None = _extract_function(source, func_name)
 
         if func_src is None:
-            console.print(
-                f"[error]Function '{func_name}' not found in {resolved}.  "
-                f"Falling back to full file check.[/error]"
-            )
+            console.print(f"[error]Function '{func_name}' not found. Falling back to full file.[/error]")
             prompt = _build_check_prompt(resolved, source, f"file ({Path(resolved).name})")
         else:
             label: str = f"{Path(resolved).name}:{func_name}"
             console.print(f"[info]Checking function '{func_name}' in {resolved}[/info]")
             prompt = _build_check_prompt(label, func_src, f"function '{func_name}'")
 
-    # ── /check file.py ────────────────────────────────────────────────────────────────
     else:
         resolved = resolve_path(arg_clean, cwd)
-
         if not Path(resolved).exists():
             console.print(f"[error]File not found: {resolved}[/error]")
             return
-
         source = read_file(resolved)
         console.print(f"[info]Checking {resolved}[/info]")
         prompt = _build_check_prompt(resolved, source, f"file ({Path(resolved).name})")
 
-    # ── Send to AI ────────────────────────────────────────────────────────────────────
     messages.append({"role": "user", "content": prompt})
     reply: str = stream_response(messages)
     if reply:
@@ -1256,14 +1126,11 @@ _SV_TYPES: dict[str, str] = {
 
 
 def _sv_fh(cwd: str) -> None:
-    """File history scoped to files that live under the current directory."""
     tracked: list[str] = _all_tracked_files()
     local: list[str]   = [fp for fp in tracked if fp.startswith(cwd)]
-
     if not local:
         console.print(f"[info]No tracked files under {cwd}.[/info]")
         return
-
     rows: list[str] = []
     for fp in local:
         _load_index(fp)
@@ -1272,27 +1139,17 @@ def _sv_fh(cwd: str) -> None:
         exists: str = "exists" if Path(fp).exists() else "missing"
         rel: str    = os.path.relpath(fp, cwd)
         rows.append(f"  {rel:<40}  ({exists:<7})  undo={u}  redo={r}")
-
-    console.print(Panel(
-        "[info]" + "\n".join(rows) + "[/info]",
-        title=f"File history  [{_short_cwd(cwd)}]",
-        border_style=SAKURA,
-    ))
+    console.print(Panel("[info]" + "\n".join(rows) + "[/info]", title=f"File history  [{_short_cwd(cwd)}]", border_style=SAKURA))
 
 
 def _sv_fhf() -> None:
-    """Full file history across every tracked project."""
     tracked: list[str] = _all_tracked_files()
-
     if not tracked:
         console.print("[info]No tracked files.[/info]")
         return
-
-    # Group by parent directory
     by_dir: dict[str, list[str]] = defaultdict(list)
     for fp in tracked:
         by_dir[str(Path(fp).parent)].append(fp)
-
     rows: list[str] = []
     for directory in sorted(by_dir):
         rows.append(f"  [{directory}]")
@@ -1301,100 +1158,57 @@ def _sv_fhf() -> None:
             u: int      = len(undo_stack[fp])
             r: int      = len(redo_stack[fp])
             exists: str = "exists" if Path(fp).exists() else "missing"
-            name: str   = Path(fp).name
-            rows.append(f"    {name:<36}  ({exists:<7})  undo={u}  redo={r}")
-
-    console.print(Panel(
-        "[info]" + "\n".join(rows) + "[/info]",
-        title="File history (all projects)",
-        border_style=SAKURA,
-    ))
+            rows.append(f"    {Path(fp).name:<36}  ({exists:<7})  undo={u}  redo={r}")
+    console.print(Panel("[info]" + "\n".join(rows) + "[/info]", title="File history (all projects)", border_style=SAKURA))
 
 
 def _sv_sessions() -> None:
-    """List all saved session files."""
     if not SESSION_DIR.exists():
         console.print("[info]No sessions saved yet.[/info]")
         return
-
     files: list[Path] = sorted(SESSION_DIR.glob("*.json"))
     if not files:
         console.print("[info]No sessions saved yet.[/info]")
         return
-
     rows: list[str] = []
     for sf in files:
         try:
-            data: dict    = json.loads(sf.read_text(encoding="utf-8"))
+            data: dict     = json.loads(sf.read_text(encoding="utf-8"))
             saved_cwd: str = data.get("cwd", "?")
             saved_at: str  = data.get("saved_at", "?")[:19].replace("T", "  ")
             msg_count: int = len(data.get("messages", []))
             size: int      = sf.stat().st_size
-            rows.append(
-                f"  {saved_cwd:<45}  {saved_at}  "
-                f"{msg_count:>3} msg  {size:>6} B"
-            )
+            rows.append(f"  {saved_cwd:<45}  {saved_at}  {msg_count:>3} msg  {size:>6} B")
         except Exception:
             rows.append(f"  {sf.name}  (unreadable)")
-
-    console.print(Panel(
-        "[info]" + "\n".join(rows) + "[/info]",
-        title=f"Saved sessions  ({SESSION_DIR})",
-        border_style=SAKURA,
-    ))
+    console.print(Panel("[info]" + "\n".join(rows) + "[/info]", title=f"Saved sessions  ({SESSION_DIR})", border_style=SAKURA))
 
 
 def _sv_stack() -> None:
-    """Show undo/redo stack depth for every tracked file."""
     tracked: list[str] = _all_tracked_files()
-
     if not tracked:
         console.print("[info]No tracked files.[/info]")
         return
-
     rows: list[str] = []
-    total_baks: int = 0
+    total_baks: int  = 0
     total_bytes: int = 0
-
     for fp in tracked:
         _load_index(fp)
         u: int = len(undo_stack[fp])
         r: int = len(redo_stack[fp])
-        bak_bytes: int = sum(
-            bak.stat().st_size
-            for bak in undo_stack[fp] + redo_stack[fp]
-            if bak.exists()
-        )
+        bak_bytes: int = sum(bak.stat().st_size for bak in undo_stack[fp] + redo_stack[fp] if bak.exists())
         total_baks  += u + r
         total_bytes += bak_bytes
-        rows.append(
-            f"  {fp:<50}  undo={u:<3}  redo={r:<3}  "
-            f"{bak_bytes:>8} B stored"
-        )
-
+        rows.append(f"  {fp:<50}  undo={u:<3}  redo={r:<3}  {bak_bytes:>8} B stored")
     rows.append("")
-    rows.append(
-        f"  Total: {total_baks} snapshots,  "
-        f"{total_bytes:,} bytes  ({total_bytes // 1024} KB)  "
-        f"in {VC_DIR}"
-    )
-
-    console.print(Panel(
-        "[info]" + "\n".join(rows) + "[/info]",
-        title="Undo/redo stack",
-        border_style=SAKURA,
-    ))
+    rows.append(f"  Total: {total_baks} snapshots,  {total_bytes:,} bytes  ({total_bytes // 1024} KB)  in {VC_DIR}")
+    console.print(Panel("[info]" + "\n".join(rows) + "[/info]", title="Undo/redo stack", border_style=SAKURA))
 
 
 def _sv_env(cwd: str, messages: list[dict]) -> None:
-    """Show runtime environment information."""
     session_file: Path = _session_path(cwd)
-    sess_size: str     = (
-        f"{session_file.stat().st_size:,} B"
-        if session_file.exists() else "(no session file)"
-    )
+    sess_size: str = f"{session_file.stat().st_size:,} B" if session_file.exists() else "(no session file)"
     msg_count: int = len([m for m in messages if m["role"] != "system"])
-
     rows: list[str] = [
         f"  Model        : {MODEL}",
         f"  CWD          : {cwd}",
@@ -1404,18 +1218,11 @@ def _sv_env(cwd: str, messages: list[dict]) -> None:
         f"  Messages     : {msg_count} in current session",
         f"  Python       : {sys.version.split()[0]}  ({sys.executable})",
     ]
-
-    console.print(Panel(
-        "[info]" + "\n".join(rows) + "[/info]",
-        title="Environment",
-        border_style=SAKURA_DEEP,
-    ))
+    console.print(Panel("[info]" + "\n".join(rows) + "[/info]", title="Environment", border_style=SAKURA_DEEP))
 
 
 def handle_stackview(sv_type: str, cwd: str, messages: list[dict]) -> None:
-    """Dispatch /stackview <type>."""
     t: str = sv_type.strip().lower()
-
     if t == "fh":
         _sv_fh(cwd)
     elif t == "fhf":
@@ -1428,18 +1235,10 @@ def handle_stackview(sv_type: str, cwd: str, messages: list[dict]) -> None:
         _sv_env(cwd, messages)
     elif t in ("", "help"):
         rows: list[str] = [f"  {k:<12}  {v}" for k, v in _SV_TYPES.items()]
-        rows.append("  sess        Alias for 'sessions'")
-        rows.append("  environment Alias for 'env'")
-        console.print(Panel(
-            "[info]" + "\n".join(rows) + "[/info]",
-            title="/stackview types",
-            border_style=SAKURA_DEEP,
-        ))
+        rows += ["  sess        Alias for 'sessions'", "  environment Alias for 'env'"]
+        console.print(Panel("[info]" + "\n".join(rows) + "[/info]", title="/stackview types", border_style=SAKURA_DEEP))
     else:
-        console.print(
-            f"[error]Unknown stackview type: '{t}'.  "
-            f"Run /stackview help for a list.[/error]"
-        )
+        console.print(f"[error]Unknown stackview type: '{t}'. Run /stackview help.[/error]")
 
 
 # ── Slash commands ───────────────────────────────────────────────────────────────────
@@ -1448,8 +1247,7 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
     parts: list[str] = cmd.strip().split(maxsplit=1)
     name: str        = parts[0].lower()
     arg: str         = parts[1] if len(parts) > 1 else ""
-
-    cwd: str = state["cwd"]
+    cwd: str         = state["cwd"]
 
     if name in ("/quit", "/exit", "/q"):
         console.print("[info]Goodbye.[/info]")
@@ -1466,29 +1264,19 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
                     console.print(f"[error]{target} is not a directory.[/error]")
                 else:
                     save_session(cwd, messages)
-
                     state["cwd"] = str(target)
                     os.chdir(target)
-
                     new_messages: list[dict] = load_session(str(target))
                     messages.clear()
                     messages.extend(new_messages)
-                    state["first_message"] = not any(
-                        m["role"] != "system" for m in messages
-                    )
-
+                    state["first_message"] = not any(m["role"] != "system" for m in messages)
                     try:
-                        entries: list[str] = [
-                            e.name for e in target.iterdir()
-                            if not e.name.startswith(".")
-                        ][:30]
+                        entries: list[str] = [e.name for e in target.iterdir() if not e.name.startswith(".")][:30]
                     except Exception:
                         entries = []
                     console.print(Panel(
-                        f"[info]Changed to: [bold]{target}[/bold]\n"
-                        f"Contents: {', '.join(entries) if entries else '(empty)'}[/info]",
-                        title="cd",
-                        border_style=SAKURA,
+                        f"[info]Changed to: [bold]{target}[/bold]\nContents: {', '.join(entries) if entries else '(empty)'}[/info]",
+                        title="cd", border_style=SAKURA,
                     ))
             except FileNotFoundError:
                 console.print(f"[error]Directory not found: {arg}[/error]")
@@ -1502,12 +1290,10 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
         if not arg:
             console.print("[error]Usage: /read <filepath> | /read -a[/error]")
         elif arg.strip() == "-a":
-            # ── /read -a: recursively read every file in the tree ────────────────
             try:
                 all_files: list[Path] = [
                     f for f in Path(cwd).rglob("*")
-                    if f.is_file()
-                    and not any(part.startswith(".") for part in f.parts)
+                    if f.is_file() and not any(part.startswith(".") for part in f.parts)
                 ]
             except Exception as exc:
                 console.print(f"[error]Could not scan directory: {exc}[/error]")
@@ -1515,7 +1301,6 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
                 snippets: list[str] = []
                 total_chars: int    = 0
                 skipped: list[str]  = []
-
                 for sf in sorted(all_files):
                     rel: str = os.path.relpath(str(sf), cwd)
                     try:
@@ -1528,25 +1313,20 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
                         continue
                     snippets.append(f"### {rel}\n```\n{file_content}\n```")
                     total_chars += len(file_content)
-
                 if skipped:
                     console.print(
-                        f"[info]Skipped (unreadable or too large): "
+                        "[info]Skipped (unreadable or too large): "
                         + ", ".join(skipped[:5])
                         + (" ..." if len(skipped) > 5 else "")
                         + "[/info]"
                     )
-
                 if snippets:
                     combined_all: str = (
                         f"Here are all {len(snippets)} file(s) from `{cwd}`:\n\n"
                         + "\n\n".join(snippets)
                     )
                     state.setdefault("pending_context", []).append(combined_all)
-                    console.print(
-                        f"[info]Loaded {len(snippets)} file(s) into context "
-                        f"(will attach to your next message).[/info]"
-                    )
+                    console.print(f"[info]Loaded {len(snippets)} file(s) into context (will attach to your next message).[/info]")
                 else:
                     console.print("[info]No readable files found.[/info]")
         else:
@@ -1568,12 +1348,7 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
     elif name == "/undo":
         if not arg:
             tracked: list[str] = _all_tracked_files()
-            candidates: list[str] = []
-            for fp in tracked:
-                _load_index(fp)
-                if undo_stack[fp]:
-                    candidates.append(fp)
-
+            candidates: list[str] = [fp for fp in tracked if (_load_index(fp) or True) and undo_stack[fp]]
             if not candidates:
                 console.print("[info]No undo history.[/info]")
             elif len(candidates) == 1:
@@ -1588,12 +1363,7 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
     elif name == "/redo":
         if not arg:
             tracked = _all_tracked_files()
-            candidates = []
-            for fp in tracked:
-                _load_index(fp)
-                if redo_stack[fp]:
-                    candidates.append(fp)
-
+            candidates = [fp for fp in tracked if (_load_index(fp) or True) and redo_stack[fp]]
             if not candidates:
                 console.print("[info]No redo history.[/info]")
             elif len(candidates) == 1:
@@ -1620,19 +1390,11 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
                     r: int = len(redo_stack[fp])
                     exists: str = "exists" if Path(fp).exists() else "missing"
                     rows.append(f"  {fp}  ({exists})  undo={u}  redo={r}")
-
-                console.print(Panel(
-                    "[info]" + "\n".join(rows) + "[/info]",
-                    title="Tracked files",
-                    border_style=SAKURA,
-                ))
+                console.print(Panel("[info]" + "\n".join(rows) + "[/info]", title="Tracked files", border_style=SAKURA))
 
     elif name == "/check":
         if not arg:
-            console.print(
-                "[error]Usage: /check ALL | /check <file> | "
-                "/check <file>:<function>[/error]"
-            )
+            console.print("[error]Usage: /check ALL | /check <file> | /check <file>:<function>[/error]")
         else:
             handle_check(arg, messages, state)
 
@@ -1644,10 +1406,8 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
             console.print("[error]Usage: /commit <file> [message][/error]")
         else:
             tokens: list[str] = arg.split(maxsplit=1)
-            fp_arg: str       = tokens[0]
-            msg_arg: str      = tokens[1] if len(tokens) > 1 else ""
-            resolved_fp: str  = resolve_path(fp_arg, cwd)
-            do_commit(resolved_fp, msg_arg)
+            resolved_fp: str  = resolve_path(tokens[0], cwd)
+            do_commit(resolved_fp, tokens[1] if len(tokens) > 1 else "")
 
     elif name == "/log":
         if not arg:
@@ -1663,15 +1423,11 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
             if len(r_tokens) < 2:
                 console.print("[error]Usage: /restore <file> <commit-index>[/error]")
             else:
-                r_fp: str  = resolve_path(r_tokens[0], cwd)
-                r_idx: str = r_tokens[1].strip()
-                do_restore(r_fp, r_idx)
+                do_restore(resolve_path(r_tokens[0], cwd), r_tokens[1].strip())
 
     elif name == "/history":
         for i, m in enumerate(messages):
-            role: str    = m["role"]
-            preview: str = m["content"][:120].replace("\n", " ")
-            console.print(f"[info][{i}] {role}: {preview}[/info]")
+            console.print(f"[info][{i}] {m['role']}: {m['content'][:120].replace(chr(10), ' ')}[/info]")
 
     elif name == "/help":
         help_text: str = textwrap.dedent("""\
@@ -1723,63 +1479,30 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
 # ── Response rendering ────────────────────────────────────────────────────────────────
 
 def render_response(text: str) -> None:
-    """
-    Render the full assistant response as Rich-formatted output.
-
-    The response is split on fenced code blocks (``` ... ```):
-      - Prose segments are rendered with Rich Markdown (bold, italic,
-        bullet lists, headings, inline code, etc.).
-      - Code blocks are rendered as syntax-highlighted Panels with a
-        language label and line numbers.
-      - <!-- WRITE: path --> markers that precede a code block change
-        the panel title to "Written to <path>".
-
-    This function is the single source of truth for final output;
-    it replaces both the old render_markdown_with_code_blocks() and
-    the post-hoc _render_code_panels() approaches.
-    """
-    # Split on fenced code blocks, keeping the delimiters as separate items.
     _CODE_BLOCK_RE = re.compile(r"(```(?:\w+)?\n.*?```)", re.DOTALL)
     parts: list[str] = _CODE_BLOCK_RE.split(text)
 
     for part in parts:
         if not part:
             continue
-
         if part.startswith("```") and part.endswith("```"):
-            # ── Code block ──────────────────────────────────────────────────────────
             match = re.match(r"```(\w+)?\n(.*?)```", part, re.DOTALL)
             if not match:
-                # Malformed block — fall back to plain Markdown
                 console.print(Markdown(part))
                 continue
-
             lang: str = match.group(1) or "text"
             code: str = match.group(2)
-
-            # Check whether the prose segment just before this block
-            # contains a WRITE marker — if so, show the target path.
             block_start: int = text.find(part)
             prefix: str      = text[max(0, block_start - 200): block_start]
             write_match      = re.search(r"<!--\s*WRITE:\s*([^\s>]+)\s*-->", prefix)
-
             if write_match:
                 title: str  = f"Written to {write_match.group(1)}"
                 border: str = SAKURA_DEEP
             else:
                 title  = f"Code ({lang})"
                 border = SAKURA
-
-            console.print(Panel(
-                Syntax(code, lang, theme="dracula", line_numbers=True),
-                title=title,
-                border_style=border,
-            ))
-
+            console.print(Panel(Syntax(code, lang, theme="dracula", line_numbers=True), title=title, border_style=border))
         else:
-            # ── Prose segment ────────────────────────────────────────────────────────
-            # Strip WRITE marker comments (they're shown in the code panel
-            # title instead) and any leading/trailing whitespace.
             cleaned: str = re.sub(r"<!--\s*WRITE:[^>]+-->", "", part).strip()
             if cleaned:
                 console.print(Markdown(cleaned))
@@ -1788,37 +1511,29 @@ def render_response(text: str) -> None:
 # ── Streaming ────────────────────────────────────────────────────────────────────
 
 def _watch_for_cancel(cancel_event: threading.Event) -> None:
-    """
-    Background thread: watches stdin for Ctrl+D (0x04) and sets cancel_event.
-    Works on Unix (via tty/termios) and Windows (via msvcrt).
-    """
     try:
         import select as _sel
         import termios as _termios
         import tty as _tty
-
-        fd: int          = sys.stdin.fileno()
-        old              = _termios.tcgetattr(fd)
+        fd: int = sys.stdin.fileno()
+        old     = _termios.tcgetattr(fd)
         try:
             _tty.setraw(fd)
             while not cancel_event.is_set():
                 r, _, _ = _sel.select([sys.stdin], [], [], 0.05)
                 if r:
                     ch: bytes = os.read(fd, 1)
-                    if ch == b"\x04":   # Ctrl+D
+                    if ch == b"\x04":
                         cancel_event.set()
                         break
         finally:
             _termios.tcsetattr(fd, _termios.TCSADRAIN, old)
-
     except Exception:
-        # Windows fallback
         try:
             import msvcrt
             while not cancel_event.is_set():
                 if msvcrt.kbhit():
-                    ch_w = msvcrt.getwch()
-                    if ch_w == "\x04":
+                    if msvcrt.getwch() == "\x04":
                         cancel_event.set()
                         break
                 time.sleep(0.05)
@@ -1827,14 +1542,9 @@ def _watch_for_cancel(cancel_event: threading.Event) -> None:
 
 
 def _status_line(left: str, right: str) -> Text:
-    """
-    Build a Rich Text that prints `left` on the left and `right` right-aligned
-    to fill the terminal width.
-    """
-    width: int = console.width
+    width: int      = console.width
     plain_left: str = re.sub(r"\[/?[^\]]*\]", "", left)
     pad: int        = max(1, width - len(plain_left) - len(right))
-
     line: Text = Text()
     line.append("assistant", style=f"bold {SAKURA}")
     line.append("  ", style="")
@@ -1844,36 +1554,14 @@ def _status_line(left: str, right: str) -> Text:
     return line
 
 
-def _count_physical_lines(text: str, term_width: int) -> int:
-    """
-    Count how many physical terminal lines `text` occupies when printed,
-    accounting for line wrapping at `term_width` columns.
-
-    Strips ANSI escape codes before measuring so coloured output doesn't
-    inflate the count.
-    """
-    plain: str = re.sub(r"\033\[[^A-Za-z]*[A-Za-z]", "", text)
-    count: int = 0
-    for line in plain.split("\n"):
-        count += max(1, -(-len(line) // term_width)) if line else 1
-    return count
-
-
 def _raw_stream(
     messages: list[dict],
     cancel_event: threading.Event | None = None,
 ) -> tuple[str, int]:
-    """
-    Stream tokens from Ollama to stdout for live visual feedback.
-
-    Returns ``(full_text, physical_lines_printed)`` so the caller can
-    move the cursor back up and overwrite the raw dump with rich-formatted
-    output once streaming is complete.
-    """
-    full: str        = ""
-    term_width: int  = console.width or 80
-    phys_lines: int  = 1
-    col: int         = 0
+    full: str       = ""
+    term_width: int = console.width or 80
+    phys_lines: int = 1
+    col: int        = 0
 
     try:
         stream = ollama.chat(model=MODEL, messages=messages, stream=True)
@@ -1882,7 +1570,6 @@ def _raw_stream(
                 break
             token: str = chunk["message"]["content"]
             full += token
-
             for ch in token:
                 if ch == "\n":
                     phys_lines += 1
@@ -1892,68 +1579,27 @@ def _raw_stream(
                     if col >= term_width:
                         phys_lines += 1
                         col = 0
-
             sys.stdout.write(token)
             sys.stdout.flush()
-
         sys.stdout.write("\n")
         sys.stdout.flush()
-
     except Exception as exc:
         if not (cancel_event and cancel_event.is_set()):
             console.print(f"[error]Ollama error: {exc}[/error]")
-            console.print("[info]Make sure Ollama is running and the model is pulled:[/info]")
             console.print(f"[info]  ollama pull {MODEL}[/info]")
 
     return full, phys_lines
 
 
-def _run_with_cancel(
-    messages: list[dict],
-    status_left: str,
-    status_right: str = "ctrl+d to cancel",
-) -> tuple[str, bool]:
-    """
-    Stream a response while displaying a status line.
-    Returns (reply_text, was_cancelled).
-    """
-    cancel_event: threading.Event = threading.Event()
-
-    console.print()
-    console.print(_status_line(status_left, status_right))
-
-    watcher: threading.Thread = threading.Thread(
-        target=_watch_for_cancel,
-        args=(cancel_event,),
-        daemon=True,
-    )
-    watcher.start()
-
-    reply, _lines = _raw_stream(messages, cancel_event)
-
-    cancel_event.set()
-    watcher.join(timeout=0.5)
-
-    return reply, False
-
-
 def stream_response(messages: list[dict], cwd: str = "") -> str:
-    """
-    Stream the model response, then replace the raw streamed text with
-    fully formatted Rich Markdown + syntax-highlighted code panels.
-    """
     cancel_event: threading.Event = threading.Event()
-
     console.print()
     console.print(_status_line("thinking...", "ctrl+d to cancel"))
 
-    watcher: threading.Thread = threading.Thread(
-        target=_watch_for_cancel, args=(cancel_event,), daemon=True
-    )
+    watcher: threading.Thread = threading.Thread(target=_watch_for_cancel, args=(cancel_event,), daemon=True)
     watcher.start()
 
     full_reply, phys_lines = _raw_stream(messages, cancel_event)
-
     cancel_event.set()
     watcher.join(timeout=0.5)
 
@@ -1962,70 +1608,39 @@ def stream_response(messages: list[dict], cwd: str = "") -> str:
             console.print("[info]Cancelled.[/info]")
         return full_reply
 
-    # ── Partial-write guard ─────────────────────────────────────────────────────────────
     if _reply_has_partial_write(full_reply):
-        console.print(Panel(
-            "[info]Partial file detected. Reprompting for complete file...[/info]",
-            title="Partial write",
-            border_style=SAKURA_DARK,
-        ))
-
+        console.print(Panel("[info]Partial file detected. Reprompting...[/info]", title="Partial write", border_style=SAKURA_DARK))
         messages.append({"role": "assistant", "content": full_reply})
         messages.append({"role": "user",      "content": _PARTIAL_REPROMPT})
 
         retry_cancel: threading.Event = threading.Event()
         console.print()
         console.print(_status_line("retrying...", "ctrl+d to cancel"))
-
-        retry_watcher: threading.Thread = threading.Thread(
-            target=_watch_for_cancel, args=(retry_cancel,), daemon=True
-        )
+        retry_watcher: threading.Thread = threading.Thread(target=_watch_for_cancel, args=(retry_cancel,), daemon=True)
         retry_watcher.start()
-
         retry_reply, retry_lines = _raw_stream(messages, retry_cancel)
-
         retry_cancel.set()
         retry_watcher.join(timeout=0.5)
-
         messages.pop()
         messages.pop()
-
         if retry_reply:
-            full_reply  = retry_reply
-            phys_lines  = retry_lines
+            full_reply = retry_reply
+            phys_lines = retry_lines
 
-    # ── Overwrite raw streamed text with formatted output ───────────────────────────
     sys.stdout.write(f"\033[{phys_lines}A\033[J")
     sys.stdout.flush()
-
     render_response(full_reply)
-
     apply_file_writes(full_reply)
     apply_command_runs(full_reply, cwd, messages)
-
     return full_reply
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    parser: argparse.ArgumentParser = argparse.ArgumentParser(
-        prog="qwen3-code",
-        description="Claude Code-style TUI powered by Ollama.",
-    )
-    parser.add_argument(
-        "dir",
-        nargs="?",
-        default=None,
-        help="Working directory to open (default: current directory)",
-    )
-    parser.add_argument(
-        "--dir", "-d",
-        dest="dir_flag",
-        default=None,
-        metavar="DIR",
-        help="Working directory to open (alternative to positional arg)",
-    )
+    parser: argparse.ArgumentParser = argparse.ArgumentParser(prog="qwen3-code")
+    parser.add_argument("dir", nargs="?", default=None)
+    parser.add_argument("--dir", "-d", dest="dir_flag", default=None, metavar="DIR")
     args: argparse.Namespace = parser.parse_args()
 
     raw_dir: str | None = args.dir or args.dir_flag
@@ -2048,8 +1663,7 @@ def main() -> None:
         f"CWD   : [{SAKURA}]{initial_cwd}[/{SAKURA}]\n\n"
         f"Type [{SAKURA_DEEP}]/help[/{SAKURA_DEEP}] for commands, "
         f"[{SAKURA_DEEP}]/quit[/{SAKURA_DEEP}] to exit.",
-        border_style=SAKURA,
-        title="qwen3-code",
+        border_style=SAKURA, title="qwen3-code",
     ))
 
     messages: list[dict] = load_session(initial_cwd)
@@ -2070,7 +1684,6 @@ def main() -> None:
             break
 
         user_input = user_input.strip()
-
         if not user_input:
             continue
 
@@ -2084,22 +1697,18 @@ def main() -> None:
             continue
 
         if state["first_message"]:
-            context: str           = build_context_snippet(cwd)
-            content: str           = f"{context}\n\n{user_input}"
+            content: str           = build_context_snippet(cwd) + "\n\n" + user_input
             state["first_message"] = False
         else:
             content = user_input
 
         pending: list[str] = state.get("pending_context", [])
         if pending:
-            combined: str = "\n\n".join(pending) + "\n\n" + content
+            content = "\n\n".join(pending) + "\n\n" + content
             state["pending_context"] = []
-            content = combined
 
         messages.append({"role": "user", "content": content})
-
         reply: str = stream_response(messages, cwd)
-
         if reply:
             messages.append({"role": "assistant", "content": reply})
             save_session(cwd, messages)
