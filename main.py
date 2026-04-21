@@ -766,6 +766,29 @@ def _get_fuzzy_completions(text: str, cwd: str) -> list[str]:
     return results
 
 
+def _enable_windows_vt() -> None:
+    """
+    Enable ANSI virtual-terminal processing on Windows stdout so that
+    escape sequences like \033[1A and \033[2K are interpreted as cursor
+    control rather than printed as literal characters.
+    Safe no-op on non-Windows or if the handle is not a real console.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        import ctypes.wintypes
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        STD_OUTPUT_HANDLE: int = -11
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING: int = 0x0004
+        handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+        mode   = ctypes.wintypes.DWORD()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+    except Exception:
+        pass
+
+
 def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
     """
     Character-by-character prompt that renders fuzzy hint candidates on the
@@ -778,6 +801,9 @@ def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
     Tab completes to the first candidate.  Up/Down arrows browse history.
     Falls back to plain input() if terminal control fails.
     """
+    # Ensure ANSI escape codes work on Windows consoles.
+    _enable_windows_vt()
+
     BOLD: str  = "\033[1m"
     DIM: str   = "\033[2m"
     CYAN: str  = f"\033[38;2;{int(SAKURA_DEEP[1:3],16)};{int(SAKURA_DEEP[3:5],16)};{int(SAKURA_DEEP[5:7],16)}m"
@@ -787,9 +813,9 @@ def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
     hist_idx: int        = len(history)
     saved_buf: list[str] = []
 
-    # Track how many physical terminal lines the last hint occupied so we
-    # can erase exactly that many lines before redrawing.  Starts at 1
-    # because we print one blank hint line before the first keystroke.
+    # Track how many physical terminal lines the previous hint occupied.
+    # Starts at 1 because we print exactly one blank hint line before the
+    # first keystroke (see the sys.stdout.write(f"\n{prompt_str}") below).
     prev_hint_lines: list[int] = [1]
 
     def _text() -> str:
@@ -811,16 +837,19 @@ def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
         hint: str       = _hint_line(text)
         term_width: int = console.width or 80
 
-        # Measure visible (ANSI-stripped) length to compute physical line count
-        hint_plain: str    = re.sub(r"\033\[[^m]*m", "", hint)
+        # Measure the visible (ANSI-stripped) length to know how many physical
+        # lines the new hint will occupy.
+        hint_plain: str     = re.sub(r"\033\[[^m]*m", "", hint)
         new_hint_lines: int = max(1, -(-len(hint_plain) // term_width)) if hint_plain else 1
 
-        # Move up past the previous hint block + the prompt line, clearing each
-        lines_to_clear: int = prev_hint_lines[0] + 1
-        clear_seq: str      = "\033[1A\033[2K" * lines_to_clear
+        # Go up prev_hint_lines[0] lines to reach the first line of the old
+        # hint block, clearing each line along the way.  This is the same as
+        # the original single "\033[1A\033[2K" but repeated N times.
+        clear_seq: str = "\033[1A\033[2K" * prev_hint_lines[0]
 
         prev_hint_lines[0] = new_hint_lines
 
+        # Redraw: hint block + newline + clear prompt line + prompt + text.
         sys.stdout.write(f"{clear_seq}{hint}\n\033[2K{prompt_str}{text}")
         sys.stdout.flush()
 
@@ -1735,9 +1764,6 @@ def _run_with_cancel(
     watcher.join(timeout=0.5)
 
     cancelled: bool = bool(reply == "" or cancel_event.is_set()) and reply == ""
-    # More precise: cancelled if we stopped early
-    # We detect cancellation by checking if the event was set before _raw_stream returned
-    # naturally. We track this via a flag set in the watcher.
     return reply, False   # actual cancel detection is done by checking reply == ""
 
 def _render_code_panels(text: str) -> None:
@@ -1771,7 +1797,6 @@ def stream_response(messages: list[dict], cwd: str = "") -> str:
     """
     cancel_event: threading.Event = threading.Event()
 
-    # Print status line: "assistant  thinking..." on left, "ctrl+d to cancel" on right
     console.print()
     console.print(_status_line("thinking...", "ctrl+d to cancel"))
 
@@ -1782,7 +1807,7 @@ def stream_response(messages: list[dict], cwd: str = "") -> str:
 
     full_reply: str = _raw_stream(messages, cancel_event)
 
-    cancel_event.set()   # stop the watcher
+    cancel_event.set()
     watcher.join(timeout=0.5)
 
     if not full_reply:
@@ -1790,7 +1815,6 @@ def stream_response(messages: list[dict], cwd: str = "") -> str:
             console.print(f"[info]Cancelled.[/info]")
         return full_reply
 
-    # ── Partial-write guard ──────────────────────────────────────────────────────────────
     if _reply_has_partial_write(full_reply):
         console.print(Panel(
             "[info]Partial file detected. Reprompting for complete file...[/info]",
@@ -1801,7 +1825,6 @@ def stream_response(messages: list[dict], cwd: str = "") -> str:
         messages.append({"role": "assistant", "content": full_reply})
         messages.append({"role": "user",      "content": _PARTIAL_REPROMPT})
 
-        # Retry also supports cancellation
         retry_cancel: threading.Event = threading.Event()
         console.print()
         console.print(_status_line("retrying...", "ctrl+d to cancel"))
@@ -1852,7 +1875,6 @@ def main() -> None:
     )
     args: argparse.Namespace = parser.parse_args()
 
-    # Positional arg takes precedence over --dir flag
     raw_dir: str | None = args.dir or args.dir_flag
     if raw_dir is not None:
         target: Path = Path(raw_dir).expanduser().resolve()
@@ -1881,8 +1903,7 @@ def main() -> None:
     if any(m["role"] != "system" for m in messages):
         state["first_message"] = False
 
-    # ── Set up prompt_toolkit if available ────────────────────────────────────────
-    _input_history: list[str] = []  # per-session input history (up/down arrows)
+    _input_history: list[str] = []
 
     while True:
         cwd: str   = state["cwd"]
@@ -1916,7 +1937,6 @@ def main() -> None:
         else:
             content = user_input
 
-        # Prepend any buffered /read context to this message
         pending: list[str] = state.get("pending_context", [])
         if pending:
             combined: str = "\n\n".join(pending) + "\n\n" + content
