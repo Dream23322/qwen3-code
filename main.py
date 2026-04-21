@@ -85,7 +85,7 @@ SYSTEM_PROMPT: str = textwrap.dedent("""\
     user can /undo at any time.
 """).strip()
 
-# ── Sakura pink palette ────────────────────────────────────────────────────────────
+# ── Sakura pink palette ───────────────────────────────────────────────────────────────
 
 SAKURA: str       = "#FFB7C5"
 SAKURA_DEEP: str  = "#FF69B4"
@@ -770,9 +770,7 @@ def _get_fuzzy_completions(text: str, cwd: str) -> list[str]:
 
 def _enable_windows_vt() -> None:
     """
-    Enable ANSI virtual-terminal processing on Windows stdout so that
-    escape sequences like \033[1A and \033[2K are interpreted as cursor
-    control rather than printed as literal characters.
+    Enable ANSI virtual-terminal processing on Windows stdout.
     Safe no-op on non-Windows or if the handle is not a real console.
     """
     if sys.platform != "win32":
@@ -781,9 +779,8 @@ def _enable_windows_vt() -> None:
         import ctypes
         import ctypes.wintypes
         kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        STD_OUTPUT_HANDLE: int = -11
         ENABLE_VIRTUAL_TERMINAL_PROCESSING: int = 0x0004
-        handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+        handle = kernel32.GetStdHandle(-11)
         mode   = ctypes.wintypes.DWORD()
         if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
             kernel32.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
@@ -800,10 +797,14 @@ def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
         [hint line]   /stackview  /stack  /check …
         [prompt line] you (dir): /sta_
 
+    On Windows the hint/prompt pair is redrawn using Win32
+    SetConsoleCursorPosition so cursor movement is reliable regardless of
+    whether the terminal honours ANSI escape sequences.  On Unix the
+    existing ANSI approach is used (it works fine there).
+
     Tab completes to the first candidate.  Up/Down arrows browse history.
     Falls back to plain input() if terminal control fails.
     """
-    # Ensure ANSI escape codes work on Windows consoles.
     _enable_windows_vt()
 
     BOLD: str  = "\033[1m"
@@ -814,11 +815,6 @@ def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
     buf: list[str]       = []
     hist_idx: int        = len(history)
     saved_buf: list[str] = []
-
-    # Track how many physical terminal lines the previous hint occupied.
-    # Starts at 1 because we print exactly one blank hint line before the
-    # first keystroke (see the sys.stdout.write(f"\n{prompt_str}") below).
-    prev_hint_lines: list[int] = [1]
 
     def _text() -> str:
         return "".join(buf)
@@ -835,39 +831,102 @@ def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
                 parts_h.append(f"{DIM}{m}{RESET}")
         return "  ".join(parts_h)
 
-    def _render(text: str) -> None:
-        hint: str       = _hint_line(text)
-        term_width: int = console.width or 80
-
-        # Measure the visible (ANSI-stripped) length to know how many physical
-        # lines the new hint will occupy.
-        hint_plain: str     = re.sub(r"\033\[[^m]*m", "", hint)
-        new_hint_lines: int = max(1, -(-len(hint_plain) // term_width)) if hint_plain else 1
-
-        # Go up prev_hint_lines[0] lines to reach the first line of the old
-        # hint block, clearing each line along the way.  This is the same as
-        # the original single "\033[1A\033[2K" but repeated N times.
-        clear_seq: str = "\033[1A\033[2K" * prev_hint_lines[0]
-
-        prev_hint_lines[0] = new_hint_lines
-
-        # Redraw: hint block + newline + clear prompt line + prompt + text.
-        sys.stdout.write(f"{clear_seq}{hint}\n\033[2K{prompt_str}{text}")
-        sys.stdout.flush()
-
     def _tab_complete(text: str) -> str:
         matches: list[str] = _get_fuzzy_completions(text, cwd)
         if not matches:
             return text
         best: str = matches[0]
-        # If it's a bare command name, append a space so arg hints show next
         if best in _SLASH_COMMANDS:
             best += " "
         return best
 
-    # Print blank hint line + prompt so _render has two lines to work with
-    sys.stdout.write(f"\n{prompt_str}")
-    sys.stdout.flush()
+    # ───────────────────────────────────────────────────────────────────────
+    # Platform-specific _render implementation
+    # ───────────────────────────────────────────────────────────────────────
+
+    if sys.platform == "win32":
+        # ── Windows: use SetConsoleCursorPosition for reliable cursor movement ──
+        #
+        # ANSI cursor-up (\033[1A) is unreliable through Python stdout on many
+        # Windows console hosts even when VT processing is enabled.  Instead we
+        # record the Y coordinate of the hint row right after the initial print
+        # and jump back to it directly via Win32 API on every keystroke.
+
+        import ctypes        # type: ignore[import]
+        import ctypes.wintypes  # type: ignore[import]
+
+        class _COORD(ctypes.Structure):
+            _fields_ = [("X", ctypes.c_short), ("Y", ctypes.c_short)]
+
+        class _SMALL_RECT(ctypes.Structure):
+            _fields_ = [
+                ("Left",   ctypes.c_short), ("Top",    ctypes.c_short),
+                ("Right",  ctypes.c_short), ("Bottom", ctypes.c_short),
+            ]
+
+        class _CSBI(ctypes.Structure):
+            _fields_ = [
+                ("dwSize",              _COORD),
+                ("dwCursorPosition",    _COORD),
+                ("wAttributes",         ctypes.c_ushort),
+                ("srWindow",            _SMALL_RECT),
+                ("dwMaximumWindowSize", _COORD),
+            ]
+
+        _k32  = ctypes.windll.kernel32   # type: ignore[attr-defined]
+        _hout = _k32.GetStdHandle(-11)   # STD_OUTPUT_HANDLE
+
+        def _cur_y() -> int:
+            csbi = _CSBI()
+            _k32.GetConsoleScreenBufferInfo(_hout, ctypes.byref(csbi))
+            return int(csbi.dwCursorPosition.Y)
+
+        def _goto(x: int, y: int) -> None:
+            _k32.SetConsoleCursorPosition(_hout, _COORD(x, y))
+
+        # Print blank hint line then prompt; record the hint row's Y.
+        sys.stdout.write("\n" + prompt_str)
+        sys.stdout.flush()
+        _prompt_y: int = _cur_y()
+        _hint_y: list[int] = [_prompt_y - 1]   # mutable ref for closure
+
+        def _render(text: str) -> None:
+            hint: str       = _hint_line(text)
+            hint_plain: str = re.sub(r"\033\[[^m]*m", "", hint)
+            term_width: int = console.width or 80
+
+            # Rewrite hint row: jump to col 0, print hint + erase to EOL.
+            _goto(0, _hint_y[0])
+            # \033[K = erase from cursor to end of line (works after goto)
+            sys.stdout.write(hint + "\033[K")
+
+            # Rewrite prompt row: jump to col 0, print prompt + typed text + erase to EOL.
+            _goto(0, _hint_y[0] + 1)
+            sys.stdout.write(prompt_str + text + "\033[K")
+            sys.stdout.flush()
+
+    else:
+        # ── Unix: ANSI cursor-up works reliably ──────────────────────────────
+        prev_hint_lines: list[int] = [1]
+
+        # Print blank hint line + prompt so _render has two lines to work with.
+        sys.stdout.write(f"\n{prompt_str}")
+        sys.stdout.flush()
+
+        def _render(text: str) -> None:  # type: ignore[misc]
+            hint: str       = _hint_line(text)
+            term_width: int = console.width or 80
+
+            hint_plain: str     = re.sub(r"\033\[[^m]*m", "", hint)
+            new_hint_lines: int = max(1, -(-len(hint_plain) // term_width)) if hint_plain else 1
+
+            clear_seq: str = "\033[1A\033[2K" * prev_hint_lines[0]
+            prev_hint_lines[0] = new_hint_lines
+
+            sys.stdout.write(f"{clear_seq}{hint}\n\033[2K{prompt_str}{text}")
+            sys.stdout.flush()
+
+    # ── Input loop (shared for both platforms) ─────────────────────────────
 
     try:
         if sys.platform == "win32":
@@ -892,14 +951,18 @@ def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
                     continue
 
                 if ch in ("\r", "\n"):
+                    # Move past the prompt line before returning.
+                    _goto(0, _hint_y[0] + 1)
                     sys.stdout.write("\n")
                     sys.stdout.flush()
                     break
                 elif ch == "\x03":   # Ctrl+C
+                    _goto(0, _hint_y[0] + 1)
                     sys.stdout.write("\n")
                     sys.stdout.flush()
                     raise KeyboardInterrupt
                 elif ch == "\x04":   # Ctrl+D
+                    _goto(0, _hint_y[0] + 1)
                     sys.stdout.write("\n")
                     sys.stdout.flush()
                     raise EOFError
@@ -1789,11 +1852,9 @@ def _count_physical_lines(text: str, term_width: int) -> int:
     Strips ANSI escape codes before measuring so coloured output doesn't
     inflate the count.
     """
-    # Strip ANSI escape sequences for measurement purposes
     plain: str = re.sub(r"\033\[[^A-Za-z]*[A-Za-z]", "", text)
     count: int = 0
     for line in plain.split("\n"):
-        # Each logical line occupies at least 1 physical line; more if it wraps
         count += max(1, -(-len(line) // term_width)) if line else 1
     return count
 
@@ -1811,9 +1872,8 @@ def _raw_stream(
     """
     full: str        = ""
     term_width: int  = console.width or 80
-    # We always print at least the trailing newline, so start at 1.
     phys_lines: int  = 1
-    col: int         = 0  # current column position within the current line
+    col: int         = 0
 
     try:
         stream = ollama.chat(model=MODEL, messages=messages, stream=True)
@@ -1823,7 +1883,6 @@ def _raw_stream(
             token: str = chunk["message"]["content"]
             full += token
 
-            # Track physical lines for each character in the token.
             for ch in token:
                 if ch == "\n":
                     phys_lines += 1
@@ -1882,14 +1941,6 @@ def stream_response(messages: list[dict], cwd: str = "") -> str:
     """
     Stream the model response, then replace the raw streamed text with
     fully formatted Rich Markdown + syntax-highlighted code panels.
-
-    Flow:
-      1. Show "assistant  thinking..." status line.
-      2. Stream tokens to stdout so the user sees live output.
-      3. Record how many physical terminal lines were printed.
-      4. Move cursor back up that many lines and clear to end-of-screen.
-      5. Re-render the complete response via render_response().
-      6. Apply any WRITE / RUN markers in the reply.
     """
     cancel_event: threading.Event = threading.Event()
 
@@ -1944,7 +1995,6 @@ def stream_response(messages: list[dict], cwd: str = "") -> str:
             phys_lines  = retry_lines
 
     # ── Overwrite raw streamed text with formatted output ───────────────────────────
-    # Move cursor up phys_lines rows then clear everything below.
     sys.stdout.write(f"\033[{phys_lines}A\033[J")
     sys.stdout.flush()
 
