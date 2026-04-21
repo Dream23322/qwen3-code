@@ -564,18 +564,20 @@ def _get_fuzzy_completions(text: str, cwd: str) -> list[str]:
 
 
 def _enable_windows_vt() -> None:
+    """Enable VT100/ANSI processing on Windows 10+ consoles."""
     if sys.platform != "win32":
         return
     try:
         import ctypes
         import ctypes.wintypes
-        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-        kernel32.GetStdHandle.restype = ctypes.wintypes.HANDLE
+        k32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        k32.GetStdHandle.restype = ctypes.wintypes.HANDLE
         ENABLE_VIRTUAL_TERMINAL_PROCESSING: int = 0x0004
-        handle = kernel32.GetStdHandle(-11)
-        mode   = ctypes.wintypes.DWORD()
-        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
-            kernel32.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+        for std_fd in (-10, -11, -12):   # stdin, stdout, stderr
+            handle = k32.GetStdHandle(ctypes.c_ulong(std_fd))
+            mode   = ctypes.wintypes.DWORD(0)
+            if k32.GetConsoleMode(handle, ctypes.byref(mode)):
+                k32.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
     except Exception:
         pass
 
@@ -583,23 +585,36 @@ def _enable_windows_vt() -> None:
 def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
     """
     Character-by-character prompt with a fuzzy-hint line rendered ABOVE the
-    input line.  On Enter the hint is cleared and only the prompt + input
-    remain visible.
+    input line.  Works on Windows (PowerShell / Windows Terminal with VT
+    enabled) and Unix via ANSI escape sequences.
 
     Layout while typing:
         [hint line]   /cd ../Soda-Clicker  /cd ../Soda-Autoclicker  ...
         [prompt line] you (dir): /cd ../S_
 
-    On Windows we use Win32 SetConsoleCursorPosition with correctly-typed
-    HANDLE (64-bit safe) so the cursor can reliably jump between the two
-    rows.  On Unix we use ANSI escape sequences.
+    The hint is always kept to exactly ONE terminal line (truncated to fit)
+    so that a single \033[1A always reaches it reliably.
+
+    On Enter the hint row is cleared and the final prompt+input is left.
     """
     _enable_windows_vt()
 
     BOLD: str  = "\033[1m"
     DIM: str   = "\033[2m"
-    CYAN: str  = f"\033[38;2;{int(SAKURA_DEEP[1:3],16)};{int(SAKURA_DEEP[3:5],16)};{int(SAKURA_DEEP[5:7],16)}m"
+    CYAN: str  = (
+        f"\033[38;2;"
+        f"{int(SAKURA_DEEP[1:3],16)};"
+        f"{int(SAKURA_DEEP[3:5],16)};"
+        f"{int(SAKURA_DEEP[5:7],16)}m"
+    )
     RESET: str = "\033[0m"
+
+    # ANSI sequences used for the two-row layout:
+    #   \033[1A  → cursor up 1 row
+    #   \r       → carriage return (col 0)
+    #   \033[2K  → erase entire current line
+    UP_CLEAR   = "\033[1A\r\033[2K"   # go up to hint row, col 0, clear it
+    LINE_CLEAR = "\r\033[2K"          # stay on same row, col 0, clear it
 
     buf: list[str]       = []
     hist_idx: int        = len(history)
@@ -608,14 +623,26 @@ def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
     def _text() -> str:
         return "".join(buf)
 
-    def _hint_line(text: str) -> str:
+    def _build_hint(text: str) -> str:
+        """Return a hint string guaranteed to fit in one terminal line."""
         matches: list[str] = _get_fuzzy_completions(text, cwd)
         if not matches:
             return ""
+        term_w: int = max(40, (console.width or 80) - 2)
         parts_h: list[str] = []
+        plain_len: int = 0
         for i, m in enumerate(matches[:7]):
-            parts_h.append(f"{BOLD}{CYAN}{m}{RESET}" if i == 0 else f"{DIM}{m}{RESET}")
-        return "  ".join(parts_h)
+            sep = "  " if parts_h else ""
+            if plain_len + len(sep) + len(m) > term_w:
+                break
+            parts_h.append(
+                f"{BOLD}{CYAN}{m}{RESET}" if i == 0 else f"{DIM}{m}{RESET}"
+            )
+            plain_len += len(sep) + len(m)
+        return "  ".join(
+            re.sub(r"\033\[[^m]*m", "", p) and p or p   # keep styled parts
+            for p in parts_h
+        )
 
     def _tab_complete(text: str) -> str:
         matches: list[str] = _get_fuzzy_completions(text, cwd)
@@ -624,115 +651,35 @@ def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
         best: str = matches[0]
         return best + " " if best in _SLASH_COMMANDS else best
 
-    # ── Platform-specific render ─────────────────────────────────────────────
+    # ── Initial print: blank hint line + prompt ──────────────────────────────
+    # After this write, cursor is at the END of prompt_str on the PROMPT row.
+    # The blank line above is the HINT row.  \033[1A always reaches it.
+    sys.stdout.write("\n" + prompt_str)
+    sys.stdout.flush()
 
-    if sys.platform == "win32":
-        # ──────────────────────────────────────────────────────────────────────
-        # Win32 cursor positioning.
-        #
-        # IMPORTANT: on 64-bit Windows, GetStdHandle returns a 64-bit HANDLE.
-        # Without setting restype = HANDLE, ctypes truncates it to 32 bits,
-        # which makes SetConsoleCursorPosition fail silently and the hint+prompt
-        # end up on the same line.  We fix this by declaring proper argtypes and
-        # restype for every Win32 call we make.
-        # ──────────────────────────────────────────────────────────────────────
-        import ctypes        # type: ignore[import]
-        import ctypes.wintypes  # type: ignore[import]
-
-        # ---- type definitions ----
-        class _COORD(ctypes.Structure):
-            _fields_ = [("X", ctypes.c_short), ("Y", ctypes.c_short)]
-
-        class _SMALL_RECT(ctypes.Structure):
-            _fields_ = [
-                ("Left",   ctypes.c_short), ("Top",    ctypes.c_short),
-                ("Right",  ctypes.c_short), ("Bottom", ctypes.c_short),
-            ]
-
-        class _CSBI(ctypes.Structure):
-            _fields_ = [
-                ("dwSize",              _COORD),
-                ("dwCursorPosition",    _COORD),
-                ("wAttributes",         ctypes.c_ushort),
-                ("srWindow",            _SMALL_RECT),
-                ("dwMaximumWindowSize", _COORD),
-            ]
-
-        _k32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-
-        # ---- declare types so 64-bit HANDLE is not truncated ----
-        _k32.GetStdHandle.restype  = ctypes.wintypes.HANDLE
-        _k32.GetStdHandle.argtypes = [ctypes.wintypes.DWORD]
-
-        _k32.GetConsoleScreenBufferInfo.restype  = ctypes.wintypes.BOOL
-        _k32.GetConsoleScreenBufferInfo.argtypes = [
-            ctypes.wintypes.HANDLE,
-            ctypes.POINTER(_CSBI),
-        ]
-
-        _k32.SetConsoleCursorPosition.restype  = ctypes.wintypes.BOOL
-        _k32.SetConsoleCursorPosition.argtypes = [
-            ctypes.wintypes.HANDLE,
-            _COORD,   # passed by value
-        ]
-
-        _hout = _k32.GetStdHandle(ctypes.wintypes.DWORD(-11))  # STD_OUTPUT_HANDLE
-
-        def _cur_y() -> int:
-            csbi = _CSBI()
-            _k32.GetConsoleScreenBufferInfo(_hout, ctypes.byref(csbi))
-            return int(csbi.dwCursorPosition.Y)
-
-        def _goto(x: int, y: int) -> None:
-            coord = _COORD(x, y)
-            _k32.SetConsoleCursorPosition(_hout, coord)
-
-        # Print blank hint line then prompt; record the row numbers.
-        sys.stdout.write("\n" + prompt_str)
-        sys.stdout.flush()
-        _prompt_y: int     = _cur_y()
-        _hint_y: list[int] = [_prompt_y - 1]  # row directly above prompt
-
-        def _render(text: str) -> None:
-            hint: str = _hint_line(text)
-            # Rewrite hint row
-            _goto(0, _hint_y[0])
-            sys.stdout.write(hint + "\033[K")   # \033[K = erase to EOL
-            # Rewrite prompt row
-            _goto(0, _hint_y[0] + 1)
-            sys.stdout.write(prompt_str + text + "\033[K")
-            sys.stdout.flush()
-
-        def _clear_hint() -> None:
-            """Erase the hint row and move cursor to start of prompt row."""
-            _goto(0, _hint_y[0])
-            sys.stdout.write("\033[K")
-            _goto(0, _hint_y[0] + 1)
-            sys.stdout.flush()
-
-    else:
-        # ── Unix: ANSI escape sequences ─────────────────────────────────────
-        prev_hint_lines: list[int] = [1]
-        sys.stdout.write(f"\n{prompt_str}")
+    def _render(text: str) -> None:
+        """
+        Redraw both rows in place:
+          1. Jump up to hint row, clear it, write new hint.
+          2. Move down to prompt row, clear it, write prompt+text.
+        Cursor ends at column len(prompt_str + text) on the prompt row.
+        """
+        hint: str = _build_hint(text)
+        sys.stdout.write(
+            UP_CLEAR           # ↑ to hint row, col 0, erase
+            + hint             # write hint (guaranteed single-line width)
+            + "\n"             # ↓ to prompt row (col = end of hint text)
+            + LINE_CLEAR       # col 0, erase prompt row
+            + prompt_str + text
+        )
         sys.stdout.flush()
 
-        def _render(text: str) -> None:  # type: ignore[misc]
-            hint: str           = _hint_line(text)
-            term_width: int     = console.width or 80
-            hint_plain: str     = re.sub(r"\033\[[^m]*m", "", hint)
-            new_hint_lines: int = max(1, -(-len(hint_plain) // term_width)) if hint_plain else 1
-            clear_seq: str      = "\033[1A\033[2K" * prev_hint_lines[0]
-            prev_hint_lines[0]  = new_hint_lines
-            sys.stdout.write(f"{clear_seq}{hint}\n\033[2K{prompt_str}{text}")
-            sys.stdout.flush()
-
-        def _clear_hint() -> None:  # type: ignore[misc]
-            # Go up to hint line and erase it, leave cursor at start of prompt.
-            sys.stdout.write("\033[1A\033[2K")
-            sys.stdout.flush()
+    def _clear_hint() -> None:
+        """Erase the hint row; leave cursor at col 0 of the prompt row."""
+        sys.stdout.write(UP_CLEAR + "\n" + LINE_CLEAR)
+        sys.stdout.flush()
 
     # ── Input loop ────────────────────────────────────────────────────────────
-
     try:
         if sys.platform == "win32":
             import msvcrt
@@ -741,17 +688,21 @@ def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
                 ch: str = msvcrt.getwch()  # type: ignore[attr-defined]
 
                 if ch in ("\x00", "\xe0"):
+                    # Extended key prefix
                     ch2: str = msvcrt.getwch()  # type: ignore[attr-defined]
-                    if ch2 == "H":   # up arrow
+                    if ch2 == "H":   # up arrow → history back
                         if hist_idx > 0:
                             if hist_idx == len(history):
                                 saved_buf = buf[:]
                             hist_idx -= 1
                             buf[:] = list(history[hist_idx])
-                    elif ch2 == "P": # down arrow
+                    elif ch2 == "P": # down arrow → history forward
                         if hist_idx < len(history):
                             hist_idx += 1
-                            buf[:] = list(history[hist_idx] if hist_idx < len(history) else saved_buf)
+                            buf[:] = list(
+                                history[hist_idx] if hist_idx < len(history)
+                                else saved_buf
+                            )
                     _render(_text())
                     continue
 
@@ -760,20 +711,20 @@ def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
                     sys.stdout.write(prompt_str + _text() + "\n")
                     sys.stdout.flush()
                     break
-                elif ch == "\x03":
+                elif ch == "\x03":   # Ctrl-C
                     _clear_hint()
                     sys.stdout.write("\n")
                     sys.stdout.flush()
                     raise KeyboardInterrupt
-                elif ch == "\x04":
+                elif ch == "\x04":   # Ctrl-D
                     _clear_hint()
                     sys.stdout.write("\n")
                     sys.stdout.flush()
                     raise EOFError
-                elif ch in ("\x08", "\x7f"):
+                elif ch in ("\x08", "\x7f"):  # backspace
                     if buf:
                         buf.pop()
-                elif ch == "\t":
+                elif ch == "\t":     # tab complete
                     buf[:] = list(_tab_complete(_text()))
                 else:
                     buf.append(ch)
@@ -824,7 +775,11 @@ def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
                         elif rest == b"[B":
                             if hist_idx < len(history):
                                 hist_idx += 1
-                                buf[:] = list(history[hist_idx] if hist_idx < len(history) else saved_buf)
+                                buf[:] = list(
+                                    history[hist_idx]
+                                    if hist_idx < len(history)
+                                    else saved_buf
+                                )
                     else:
                         try:
                             buf.append(raw.decode("utf-8"))
