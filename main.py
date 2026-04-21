@@ -787,6 +787,11 @@ def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
     hist_idx: int        = len(history)
     saved_buf: list[str] = []
 
+    # Track how many physical terminal lines the last hint occupied so we
+    # can erase exactly that many lines before redrawing.  Starts at 1
+    # because we print one blank hint line before the first keystroke.
+    prev_hint_lines: list[int] = [1]
+
     def _text() -> str:
         return "".join(buf)
 
@@ -803,10 +808,20 @@ def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
         return "  ".join(parts_h)
 
     def _render(text: str) -> None:
-        hint: str = _hint_line(text)
-        # \033[1A  = cursor up 1 line
-        # \033[2K  = erase entire line
-        sys.stdout.write(f"\033[1A\033[2K{hint}\n\033[2K{prompt_str}{text}")
+        hint: str       = _hint_line(text)
+        term_width: int = console.width or 80
+
+        # Measure visible (ANSI-stripped) length to compute physical line count
+        hint_plain: str    = re.sub(r"\033\[[^m]*m", "", hint)
+        new_hint_lines: int = max(1, -(-len(hint_plain) // term_width)) if hint_plain else 1
+
+        # Move up past the previous hint block + the prompt line, clearing each
+        lines_to_clear: int = prev_hint_lines[0] + 1
+        clear_seq: str      = "\033[1A\033[2K" * lines_to_clear
+
+        prev_hint_lines[0] = new_hint_lines
+
+        sys.stdout.write(f"{clear_seq}{hint}\n\033[2K{prompt_str}{text}")
         sys.stdout.flush()
 
     def _tab_complete(text: str) -> str:
