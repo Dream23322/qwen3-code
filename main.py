@@ -284,7 +284,7 @@ def do_restore(filepath: str, idx_str: str) -> None:
         return
 
     if idx < 0 or idx >= len(entries):
-        console.print(f"[error]Index {idx} out of range (0–{len(entries)-1}).[/error]")
+        console.print(f"[error]Index {idx} out of range (0\u2013{len(entries)-1}).[/error]")
         return
 
     snap_path: Path = Path(entries[idx]["snapshot"])
@@ -307,7 +307,7 @@ def do_restore(filepath: str, idx_str: str) -> None:
         f"[info]Restored [bold]{filepath}[/bold] to commit #{idx}\n"
         f"Message  : {entries[idx]['message']}\n"
         f"Timestamp: {entries[idx]['timestamp']}\n\n"
-        f"Previous state saved — use /undo to go back.[/info]",
+        f"Previous state saved \u2014 use /undo to go back.[/info]",
         title="Restore",
         border_style=SAKURA,
     ))
@@ -499,8 +499,8 @@ _PARTIAL_PATTERNS: list[re.Pattern] = [
     re.compile(r"^\s*#\s*\.{3}\s*$",                   re.MULTILINE),  # # ...
     re.compile(r"^\s*//\s*\.{3}\s*$",                  re.MULTILINE),  # // ...
     re.compile(r"#\s*(rest|remainder|remaining)\s+of",  re.IGNORECASE),
-    re.compile(r"#\s*\.\.\.\.?",                        re.IGNORECASE),
-    re.compile(r"//\s*\.\.\.\.?",                       re.IGNORECASE),
+    re.compile(r"#\s*\.\.\.\.*",                        re.IGNORECASE),
+    re.compile(r"//\s*\.\.\.\.*",                       re.IGNORECASE),
     re.compile(r"\[\s*previous\s+(code|content)",       re.IGNORECASE),
     re.compile(r"\[\s*rest\s+of\s+(the\s+)?code",       re.IGNORECASE),
     re.compile(r"# same as before",                     re.IGNORECASE),
@@ -607,6 +607,7 @@ _CMD_SUBARGS: dict[str, list[str]] = {
         "fh", "fhf", "sessions", "sess", "stack", "env", "environment", "help",
     ],
     "/check": ["ALL"],
+    "/read":  ["-a"],
 }
 
 # Commands whose second token is a file/directory path
@@ -666,7 +667,8 @@ if _PT_AVAILABLE:
                         yield Completion(sub, start_position=-len(arg_so_far))
 
             # File/directory completions for file-taking commands
-            if cmd in _FILE_COMMANDS:
+            # Skip file completions when the argument is a flag like -a
+            if cmd in _FILE_COMMANDS and not arg_so_far.startswith("-"):
                 cwd: str = self._cwd()
                 try:
                     base: Path = Path(cwd)
@@ -729,7 +731,7 @@ def _get_fuzzy_completions(text: str, cwd: str) -> list[str]:
             ):
                 results.append(f"{typed_cmd} {sub}")
 
-    if not results and cmd in _FILE_COMMANDS:
+    if not results and cmd in _FILE_COMMANDS and not arg_so_far.startswith("-"):
         # For /cd, enumerate subdirectories of the path typed so far
         if cmd == "/cd":
             try:
@@ -1435,7 +1437,55 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
 
     elif name == "/read":
         if not arg:
-            console.print("[error]Usage: /read <filepath>[/error]")
+            console.print("[error]Usage: /read <filepath> | /read -a[/error]")
+        elif arg.strip() == "-a":
+            # ── /read -a: recursively read every file in the tree ────────────────
+            try:
+                all_files: list[Path] = [
+                    f for f in Path(cwd).rglob("*")
+                    if f.is_file()
+                    and not any(part.startswith(".") for part in f.parts)
+                ]
+            except Exception as exc:
+                console.print(f"[error]Could not scan directory: {exc}[/error]")
+            else:
+                snippets: list[str] = []
+                total_chars: int    = 0
+                skipped: list[str]  = []
+
+                for sf in sorted(all_files):
+                    rel: str = os.path.relpath(str(sf), cwd)
+                    try:
+                        file_content: str = sf.read_text(encoding="utf-8", errors="replace")
+                    except Exception:
+                        skipped.append(rel)
+                        continue
+                    if total_chars + len(file_content) > 400_000:
+                        skipped.append(rel)
+                        continue
+                    snippets.append(f"### {rel}\n```\n{file_content}\n```")
+                    total_chars += len(file_content)
+
+                if skipped:
+                    console.print(
+                        f"[info]Skipped (unreadable or too large): "
+                        + ", ".join(skipped[:5])
+                        + (" ..." if len(skipped) > 5 else "")
+                        + "[/info]"
+                    )
+
+                if snippets:
+                    combined_all: str = (
+                        f"Here are all {len(snippets)} file(s) from `{cwd}`:\n\n"
+                        + "\n\n".join(snippets)
+                    )
+                    state.setdefault("pending_context", []).append(combined_all)
+                    console.print(
+                        f"[info]Loaded {len(snippets)} file(s) into context "
+                        f"(will attach to your next message).[/info]"
+                    )
+                else:
+                    console.print("[info]No readable files found.[/info]")
         else:
             resolved: str = resolve_path(arg, cwd)
             content: str  = read_file(resolved)
@@ -1565,6 +1615,7 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
             Available commands:
               /cd [dir]         - change working directory (no arg = show current)
               /read <file>      - load a file into the conversation context
+              /read -a          - load ALL files in the tree recursively (up to 400 KB)
               /run <cmd>        - run a shell command and add output to context
               /undo [file]      - revert the last AI-written file edit
               /redo [file]      - re-apply a reverted edit
@@ -1589,6 +1640,8 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
 
             /read and WRITE_FILE paths are resolved relative to the current
             working directory set by /cd.
+            /read -a skips hidden files/dirs (those starting with a dot) and
+            caps total content at 400 KB to avoid context overflow.
             Version history is persisted to ~/.local/share/qwen3-code/vc/
             and survives across sessions.
 
