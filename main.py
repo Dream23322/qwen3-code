@@ -1440,9 +1440,6 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
             resolved: str = resolve_path(arg, cwd)
             content: str  = read_file(resolved)
             snippet: str  = f"Here is the content of `{resolved}`:\n\n```\n{content}\n```"
-            # Buffer into pending_context so it gets merged with the next
-            # user message rather than sent as a standalone message.
-            # Two consecutive user messages confuse most models.
             state.setdefault("pending_context", []).append(snippet)
             console.print(f"[info]Loaded {resolved} into context (will attach to your next message).[/info]")
 
@@ -1530,7 +1527,6 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
         handle_stackview(arg, cwd, messages)
 
     elif name == "/commit":
-        # /commit <file> [message]
         if not arg:
             console.print("[error]Usage: /commit <file> [message][/error]")
         else:
@@ -1547,7 +1543,6 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
             show_log(resolve_path(arg.split()[0], cwd))
 
     elif name == "/restore":
-        # /restore <file> <commit-index>
         if not arg:
             console.print("[error]Usage: /restore <file> <commit-index>[/error]")
         else:
@@ -1609,40 +1604,66 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
     return True
 
 
-# ── Rendering ─────────────────────────────────────────────────────────────────────
+# ── Response rendering ────────────────────────────────────────────────────────────────
 
-def render_markdown_with_code_blocks(text: str) -> None:
-    pattern: str     = r"(```(?:\w+)?\n.*?```)"
-    parts: list[str] = re.split(pattern, text, flags=re.DOTALL)
+def render_response(text: str) -> None:
+    """
+    Render the full assistant response as Rich-formatted output.
+
+    The response is split on fenced code blocks (``` ... ```):
+      - Prose segments are rendered with Rich Markdown (bold, italic,
+        bullet lists, headings, inline code, etc.).
+      - Code blocks are rendered as syntax-highlighted Panels with a
+        language label and line numbers.
+      - <!-- WRITE: path --> markers that precede a code block change
+        the panel title to "Written to <path>".
+
+    This function is the single source of truth for final output;
+    it replaces both the old render_markdown_with_code_blocks() and
+    the post-hoc _render_code_panels() approaches.
+    """
+    # Split on fenced code blocks, keeping the delimiters as separate items.
+    _CODE_BLOCK_RE = re.compile(r"(```(?:\w+)?\n.*?```)", re.DOTALL)
+    parts: list[str] = _CODE_BLOCK_RE.split(text)
 
     for part in parts:
         if not part:
             continue
 
         if part.startswith("```") and part.endswith("```"):
+            # ── Code block ──────────────────────────────────────────────────────────
             match = re.match(r"```(\w+)?\n(.*?)```", part, re.DOTALL)
-            if match:
-                lang: str = match.group(1) or "text"
-                code: str = match.group(2)
+            if not match:
+                # Malformed block — fall back to plain Markdown
+                console.print(Markdown(part))
+                continue
 
-                block_start: int = text.find(part)
-                prefix: str      = text[max(0, block_start - 120): block_start]
-                write_match      = re.search(r"<!--\s*WRITE:\s*([^\s>]+)\s*-->", prefix)
+            lang: str = match.group(1) or "text"
+            code: str = match.group(2)
 
-                if write_match:
-                    fp: str     = write_match.group(1)
-                    title: str  = f"Written to {fp}"
-                    border: str = SAKURA_DEEP
-                else:
-                    title  = f"Code ({lang})"
-                    border = SAKURA
+            # Check whether the prose segment just before this block
+            # contains a WRITE marker — if so, show the target path.
+            block_start: int = text.find(part)
+            prefix: str      = text[max(0, block_start - 200): block_start]
+            write_match      = re.search(r"<!--\s*WRITE:\s*([^\s>]+)\s*-->", prefix)
 
-                console.print(Panel(
-                    Syntax(code, lang, theme="dracula", line_numbers=True),
-                    title=title,
-                    border_style=border,
-                ))
+            if write_match:
+                title: str  = f"Written to {write_match.group(1)}"
+                border: str = SAKURA_DEEP
+            else:
+                title  = f"Code ({lang})"
+                border = SAKURA
+
+            console.print(Panel(
+                Syntax(code, lang, theme="dracula", line_numbers=True),
+                title=title,
+                border_style=border,
+            ))
+
         else:
+            # ── Prose segment ────────────────────────────────────────────────────────
+            # Strip WRITE marker comments (they're shown in the code panel
+            # title instead) and any leading/trailing whitespace.
             cleaned: str = re.sub(r"<!--\s*WRITE:[^>]+-->", "", part).strip()
             if cleaned:
                 console.print(Markdown(cleaned))
@@ -1695,7 +1716,6 @@ def _status_line(left: str, right: str) -> Text:
     to fill the terminal width.
     """
     width: int = console.width
-    # Strip Rich markup from left for length calculation
     plain_left: str = re.sub(r"\[/?[^\]]*\]", "", left)
     pad: int        = max(1, width - len(plain_left) - len(right))
 
@@ -1708,29 +1728,72 @@ def _status_line(left: str, right: str) -> Text:
     return line
 
 
+def _count_physical_lines(text: str, term_width: int) -> int:
+    """
+    Count how many physical terminal lines `text` occupies when printed,
+    accounting for line wrapping at `term_width` columns.
+
+    Strips ANSI escape codes before measuring so coloured output doesn't
+    inflate the count.
+    """
+    # Strip ANSI escape sequences for measurement purposes
+    plain: str = re.sub(r"\033\[[^A-Za-z]*[A-Za-z]", "", text)
+    count: int = 0
+    for line in plain.split("\n"):
+        # Each logical line occupies at least 1 physical line; more if it wraps
+        count += max(1, -(-len(line) // term_width)) if line else 1
+    return count
+
+
 def _raw_stream(
     messages: list[dict],
     cancel_event: threading.Event | None = None,
-) -> str:
-    """Call Ollama and return the full reply string, or empty string on error."""
-    full: str = ""
+) -> tuple[str, int]:
+    """
+    Stream tokens from Ollama to stdout for live visual feedback.
+
+    Returns ``(full_text, physical_lines_printed)`` so the caller can
+    move the cursor back up and overwrite the raw dump with rich-formatted
+    output once streaming is complete.
+    """
+    full: str        = ""
+    term_width: int  = console.width or 80
+    # We always print at least the trailing newline, so start at 1.
+    phys_lines: int  = 1
+    col: int         = 0  # current column position within the current line
+
     try:
         stream = ollama.chat(model=MODEL, messages=messages, stream=True)
         for chunk in stream:
             if cancel_event and cancel_event.is_set():
                 break
-            token = chunk["message"]["content"]
+            token: str = chunk["message"]["content"]
             full += token
+
+            # Track physical lines for each character in the token.
+            for ch in token:
+                if ch == "\n":
+                    phys_lines += 1
+                    col = 0
+                else:
+                    col += 1
+                    if col >= term_width:
+                        phys_lines += 1
+                        col = 0
+
             sys.stdout.write(token)
             sys.stdout.flush()
+
         sys.stdout.write("\n")
         sys.stdout.flush()
+
     except Exception as exc:
         if not (cancel_event and cancel_event.is_set()):
             console.print(f"[error]Ollama error: {exc}[/error]")
             console.print("[info]Make sure Ollama is running and the model is pulled:[/info]")
             console.print(f"[info]  ollama pull {MODEL}[/info]")
-    return full
+
+    return full, phys_lines
 
 
 def _run_with_cancel(
@@ -1739,17 +1802,14 @@ def _run_with_cancel(
     status_right: str = "ctrl+d to cancel",
 ) -> tuple[str, bool]:
     """
-    Stream a response while displaying a status line with a right-aligned hint.
-    Starts a cancel-watcher thread; Ctrl+D sets the cancel event.
+    Stream a response while displaying a status line.
     Returns (reply_text, was_cancelled).
     """
     cancel_event: threading.Event = threading.Event()
 
-    # Print the status line (left + right-aligned hint)
     console.print()
     console.print(_status_line(status_left, status_right))
 
-    # Start cancel watcher in background
     watcher: threading.Thread = threading.Thread(
         target=_watch_for_cancel,
         args=(cancel_event,),
@@ -1757,43 +1817,26 @@ def _run_with_cancel(
     )
     watcher.start()
 
-    reply: str = _raw_stream(messages, cancel_event)
+    reply, _lines = _raw_stream(messages, cancel_event)
 
-    # Signal the watcher to stop (if it hasn't already)
     cancel_event.set()
     watcher.join(timeout=0.5)
 
-    cancelled: bool = bool(reply == "" or cancel_event.is_set()) and reply == ""
-    return reply, False   # actual cancel detection is done by checking reply == ""
+    return reply, False
 
-def _render_code_panels(text: str) -> None:
-    """Re-render only fenced code blocks as syntax-highlighted panels after streaming."""
-    pattern = r"(```(?:\w+)?\n.*?```)"
-    parts = re.split(pattern, text, flags=re.DOTALL)
-    for part in parts:
-        if part.startswith("```") and part.endswith("```"):
-            match = re.match(r"```(\w+)?\n(.*?)```", part, re.DOTALL)
-            if match:
-                lang = match.group(1) or "text"
-                code = match.group(2)
-                block_start = text.find(part)
-                prefix = text[max(0, block_start - 120): block_start]
-                write_match = re.search(r"<!--\s*WRITE:\s*([^\s>]+)\s*-->", prefix)
-                if write_match:
-                    fp = write_match.group(1)
-                    title, border = f"Written to {fp}", SAKURA_DEEP
-                else:
-                    title, border = f"Code ({lang})", SAKURA
-                console.print(Panel(
-                    Syntax(code, lang, theme="dracula", line_numbers=True),
-                    title=title,
-                    border_style=border,
-                ))
 
 def stream_response(messages: list[dict], cwd: str = "") -> str:
     """
-    Call the model, detect partial file writes, and reprompt once if needed.
-    Returns the final assistant reply (after any reprompt).
+    Stream the model response, then replace the raw streamed text with
+    fully formatted Rich Markdown + syntax-highlighted code panels.
+
+    Flow:
+      1. Show "assistant  thinking..." status line.
+      2. Stream tokens to stdout so the user sees live output.
+      3. Record how many physical terminal lines were printed.
+      4. Move cursor back up that many lines and clear to end-of-screen.
+      5. Re-render the complete response via render_response().
+      6. Apply any WRITE / RUN markers in the reply.
     """
     cancel_event: threading.Event = threading.Event()
 
@@ -1805,16 +1848,17 @@ def stream_response(messages: list[dict], cwd: str = "") -> str:
     )
     watcher.start()
 
-    full_reply: str = _raw_stream(messages, cancel_event)
+    full_reply, phys_lines = _raw_stream(messages, cancel_event)
 
     cancel_event.set()
     watcher.join(timeout=0.5)
 
     if not full_reply:
         if cancel_event.is_set():
-            console.print(f"[info]Cancelled.[/info]")
+            console.print("[info]Cancelled.[/info]")
         return full_reply
 
+    # ── Partial-write guard ─────────────────────────────────────────────────────────────
     if _reply_has_partial_write(full_reply):
         console.print(Panel(
             "[info]Partial file detected. Reprompting for complete file...[/info]",
@@ -1834,7 +1878,7 @@ def stream_response(messages: list[dict], cwd: str = "") -> str:
         )
         retry_watcher.start()
 
-        retry_reply: str = _raw_stream(messages, retry_cancel)
+        retry_reply, retry_lines = _raw_stream(messages, retry_cancel)
 
         retry_cancel.set()
         retry_watcher.join(timeout=0.5)
@@ -1843,10 +1887,17 @@ def stream_response(messages: list[dict], cwd: str = "") -> str:
         messages.pop()
 
         if retry_reply:
-            full_reply = retry_reply
+            full_reply  = retry_reply
+            phys_lines  = retry_lines
+
+    # ── Overwrite raw streamed text with formatted output ───────────────────────────
+    # Move cursor up phys_lines rows then clear everything below.
+    sys.stdout.write(f"\033[{phys_lines}A\033[J")
+    sys.stdout.flush()
+
+    render_response(full_reply)
 
     apply_file_writes(full_reply)
-    _render_code_panels(full_reply)
     apply_command_runs(full_reply, cwd, messages)
 
     return full_reply
@@ -1855,7 +1906,6 @@ def stream_response(messages: list[dict], cwd: str = "") -> str:
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    # ── CLI args ─────────────────────────────────────────────────────────────
     parser: argparse.ArgumentParser = argparse.ArgumentParser(
         prog="qwen3-code",
         description="Claude Code-style TUI powered by Ollama.",
