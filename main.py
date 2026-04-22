@@ -4,6 +4,8 @@ qwen3-code: A simple Claude Code-style TUI powered by Ollama + huihui_ai/qwen3-c
 """
 
 import argparse
+import difflib
+import hashlib
 import json
 import os
 import re
@@ -42,7 +44,7 @@ try:
 except ImportError:
     _PT_AVAILABLE = False
 
-# ── Constants ──────────────────────────────────────────────────────────────────
+# -- Constants -----------------------------------------------------------------
 
 MODEL: str        = "huihui_ai/qwen3-coder-abliterated:30b"
 VC_DIR: Path      = Path.home() / ".local" / "share" / "qwen3-code" / "vc"
@@ -84,14 +86,14 @@ SYSTEM_PROMPT: str = textwrap.dedent("""\
     user can /undo at any time.
 """).strip()
 
-# ── Sakura pink palette ───────────────────────────────────────────────────────────────
+# -- Sakura palette ------------------------------------------------------------
 
 SAKURA: str       = "#FFB7C5"
 SAKURA_DEEP: str  = "#FF69B4"
 SAKURA_MUTED: str = "#FFCDD6"
 SAKURA_DARK: str  = "#C2185B"
 
-# ── UI setup ──────────────────────────────────────────────────────────────────
+# -- UI setup ------------------------------------------------------------------
 
 custom_theme: Theme = Theme({
     "user":      f"bold {SAKURA_DEEP}",
@@ -103,7 +105,7 @@ custom_theme: Theme = Theme({
 
 console: Console = Console(theme=custom_theme)
 
-# ── Path helpers ────────────────────────────────────────────────────────────────
+# -- Path helpers --------------------------------------------------------------
 
 def _short_cwd(cwd: str) -> str:
     parts: list[str] = Path(cwd).parts
@@ -112,7 +114,7 @@ def _short_cwd(cwd: str) -> str:
     return os.path.join(parts[-2], parts[-1])
 
 
-# ── Session persistence ─────────────────────────────────────────────────────────────
+# -- Session persistence -------------------------------------------------------
 
 def _session_path(cwd: str) -> Path:
     safe: str = re.sub(r"[^\w.\-]", "_", cwd)
@@ -152,122 +154,388 @@ def load_session(cwd: str) -> list[dict]:
         return base
 
 
-# ── Version control ────────────────────────────────────────────────────────────────
+# ==============================================================================
+# Git-like version control
+# ==============================================================================
+#
+# Each file tracked by qwen3-code gets a commit tree stored in VC_DIR.
+# A commit node looks like:
+#   {
+#     "id":        "abc1234",          # 7-char hex
+#     "message":   "Fix /check cmd",   # auto-generated or user-supplied
+#     "timestamp": "2026-04-21T...",
+#     "parent_id": "def5678" | null,   # null for root commit
+#     "snapshot":  "/path/file.bak",   # full file content at this commit
+#     "children":  ["ghi9012", ...],   # child commit IDs
+#   }
+#
+# The index for a file stores all commits + current HEAD pointer.
+# Branching happens naturally: /undo then a new write creates a branch.
+# ==============================================================================
 
-undo_stack: dict[str, list[Path]] = defaultdict(list)
-redo_stack: dict[str, list[Path]] = defaultdict(list)
+_VC_CACHE: dict[str, dict] = {}   # filepath -> loaded VC index
 
 
-def _vc_dir_for(filepath: str) -> Path:
-    safe: str      = re.sub(r"[^\w.\-]", "_", Path(filepath).name)
-    full_safe: str = re.sub(r"[^\w.\-]", "_", str(Path(filepath).resolve()))
-    slot: Path     = VC_DIR / (safe + "_" + full_safe[-32:])
+def _vc_slot(filepath: str) -> Path:
+    """Return the directory holding VC data for filepath."""
+    safe: str = re.sub(r"[^\w.\-]", "_", str(Path(filepath).resolve()))[-48:]
+    slot: Path = VC_DIR / safe
     slot.mkdir(parents=True, exist_ok=True)
     return slot
 
 
-def _index_path(vc_slot: Path) -> Path:
-    return vc_slot / "index.json"
+def _vc_index_path(filepath: str) -> Path:
+    return _vc_slot(filepath) / "index.json"
 
 
-commit_log: dict[str, list[dict]] = defaultdict(list)
+def _load_vc(filepath: str) -> dict:
+    """Load (or create) the VC index for filepath."""
+    if filepath in _VC_CACHE:
+        return _VC_CACHE[filepath]
+    p: Path = _vc_index_path(filepath)
+    if p.exists():
+        try:
+            data: dict = json.loads(p.read_text(encoding="utf-8"))
+            _VC_CACHE[filepath] = data
+            return data
+        except Exception:
+            pass
+    idx: dict = {"filepath": filepath, "commits": {}, "head": None, "root": None}
+    _VC_CACHE[filepath] = idx
+    return idx
 
 
-def _save_index(filepath: str) -> None:
-    slot: Path = _vc_dir_for(filepath)
-    data: dict = {
-        "filepath": filepath,
-        "undo":     [str(p) for p in undo_stack[filepath]],
-        "redo":     [str(p) for p in redo_stack[filepath]],
-        "commits":  commit_log[filepath],
+def _save_vc(filepath: str) -> None:
+    idx: dict = _load_vc(filepath)
+    _vc_index_path(filepath).write_text(json.dumps(idx, indent=2), encoding="utf-8")
+
+
+def _vc_snapshot(filepath: str, content: str) -> Path:
+    """Write content to a .bak snapshot file and return its path."""
+    slot: Path = _vc_slot(filepath)
+    ts: str    = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    bak: Path  = slot / f"{ts}.bak"
+    bak.write_text(content, encoding="utf-8")
+    return bak
+
+
+def _make_commit_id(filepath: str, content: str, ts: str) -> str:
+    """Generate a short unique commit ID (7 hex chars)."""
+    raw: str = f"{filepath}:{ts}:{len(content)}:{content[:128]}"
+    return hashlib.sha1(raw.encode()).hexdigest()[:7]
+
+
+def _generate_commit_message(filepath: str, old_content: str, new_content: str) -> str:
+    """
+    Ask the LLM to write a one-line git-style commit message for the change.
+    Falls back to a heuristic summary if Ollama is unavailable.
+    """
+    fname: str           = Path(filepath).name
+    old_lines: list[str] = old_content.splitlines()
+    new_lines: list[str] = new_content.splitlines()
+    diff_lines: list[str] = list(difflib.unified_diff(old_lines, new_lines, lineterm="", n=2))
+    added:   int = sum(1 for l in diff_lines if l.startswith("+") and not l.startswith("+++ "))
+    removed: int = sum(1 for l in diff_lines if l.startswith("-") and not l.startswith("--- "))
+
+    if not diff_lines:
+        return f"No-op ({fname})"
+
+    snippet: str = "\n".join(diff_lines[:40])
+    prompt: str  = (
+        f"Write a concise git commit message (imperative mood, max 60 chars) "
+        f"for this change to `{fname}`. "
+        f"Reply with ONLY the commit message text, no quotes, no explanation.\n\n"
+        f"```diff\n{snippet}\n```"
+    )
+    console.print(f"[info]Generating commit message...[/info]", end="")
+    try:
+        resp = ollama.chat(
+            model=MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            stream=False,
+        )
+        msg: str = resp["message"]["content"].strip().split("\n")[0]
+        msg = msg.strip("\"'`")[:72]
+        console.print(f" [bold]{msg}[/bold]")
+        return msg or f"Update {fname}"
+    except Exception:
+        fallback: str = f"Update {fname} (+{added}/-{removed} lines)"
+        console.print(f" [dim]{fallback}[/dim]")
+        return fallback
+
+
+def _vc_commit(
+    filepath: str,
+    new_content: str,
+    message: str | None = None,
+) -> str:
+    """
+    Create a new commit for filepath with new_content.
+    If message is None, auto-generates one via the LLM.
+    Returns the new commit ID.
+    """
+    idx: dict = _load_vc(filepath)
+    ts: str   = datetime.now().isoformat()
+    cid: str  = _make_commit_id(filepath, new_content, ts)
+
+    # Snapshot the new content
+    snap: Path = _vc_snapshot(filepath, new_content)
+
+    # Auto-generate commit message
+    parent_id: str | None = idx.get("head")
+    if message is None:
+        if parent_id and parent_id in idx["commits"]:
+            try:
+                old_content: str = Path(idx["commits"][parent_id]["snapshot"]).read_text(encoding="utf-8")
+            except Exception:
+                old_content = ""
+        else:
+            old_content = ""
+        message = _generate_commit_message(filepath, old_content, new_content)
+
+    commit: dict = {
+        "id":        cid,
+        "message":   message,
+        "timestamp": ts,
+        "parent_id": parent_id,
+        "snapshot":  str(snap),
+        "children":  [],
     }
-    _index_path(slot).write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    # Register this commit as a child of the current HEAD
+    if parent_id and parent_id in idx["commits"]:
+        if cid not in idx["commits"][parent_id]["children"]:
+            idx["commits"][parent_id]["children"].append(cid)
+
+    idx["commits"][cid] = commit
+    idx["head"]          = cid
+    if not idx.get("root") or not parent_id:
+        idx["root"] = cid
+
+    _save_vc(filepath)
+    return cid
 
 
-def _load_index(filepath: str) -> None:
-    slot: Path  = _vc_dir_for(filepath)
-    index: Path = _index_path(slot)
-    if not index.exists():
+def write_file_with_vc(
+    filepath: str,
+    new_content: str,
+    commit_message: str | None = None,
+) -> None:
+    """Write new_content to filepath and record a commit in the VC tree."""
+    path: Path = Path(filepath)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(new_content, encoding="utf-8")
+
+    cid: str  = _vc_commit(filepath, new_content, commit_message)
+    idx: dict = _load_vc(filepath)
+    msg: str  = idx["commits"][cid]["message"]
+    lines: int = len(new_content.splitlines())
+
+    console.print(Panel(
+        f"[info]Wrote [bold]{lines}[/bold] lines to [bold]{filepath}[/bold]\n"
+        f"Commit [bold cyan]{cid}[/bold cyan]  {msg}[/info]",
+        title="File written", border_style=SAKURA_DEEP,
+    ))
+
+
+# -- VC navigation commands ----------------------------------------------------
+
+def _resolve_commit(filepath: str, id_prefix: str) -> str | None:
+    """Resolve a full or partial commit ID to a full ID. Returns None if not found."""
+    idx: dict = _load_vc(filepath)
+    commits: dict = idx.get("commits", {})
+    if id_prefix in commits:
+        return id_prefix
+    matches: list[str] = [cid for cid in commits if cid.startswith(id_prefix)]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        console.print(f"[error]Ambiguous prefix '{id_prefix}': {matches}[/error]")
+    else:
+        console.print(f"[error]Commit '{id_prefix}' not found in {Path(filepath).name}[/error]")
+    return None
+
+
+def do_undo(filepath: str) -> None:
+    idx: dict = _load_vc(filepath)
+    head_id: str | None = idx.get("head")
+    if not head_id or head_id not in idx["commits"]:
+        console.print(f"[error]No commits for {filepath}[/error]")
         return
-    data: dict = json.loads(index.read_text(encoding="utf-8"))
-    undo_stack[filepath]  = [Path(p) for p in data.get("undo", []) if Path(p).exists()]
-    redo_stack[filepath]  = [Path(p) for p in data.get("redo", []) if Path(p).exists()]
-    commit_log[filepath]  = [c for c in data.get("commits", []) if Path(c["snapshot"]).exists()]
+    parent_id: str | None = idx["commits"][head_id].get("parent_id")
+    if not parent_id:
+        console.print(f"[error]Already at root commit for {filepath}.[/error]")
+        return
+    parent: dict = idx["commits"][parent_id]
+    try:
+        content: str = Path(parent["snapshot"]).read_text(encoding="utf-8")
+    except Exception as exc:
+        console.print(f"[error]Snapshot missing: {exc}[/error]")
+        return
+    Path(filepath).write_text(content, encoding="utf-8")
+    idx["head"] = parent_id
+    _save_vc(filepath)
+    console.print(Panel(
+        f"[info]HEAD is now [bold cyan]{parent_id}[/bold cyan]\n"
+        f"{parent['message']}  [dim]{parent['timestamp'][:19]}[/dim]\n\n"
+        f"Tip: new writes here will create a branch.[/info]",
+        title="Undo", border_style=SAKURA,
+    ))
 
 
-# ── Named commit helpers ──────────────────────────────────────────────────────────
+def do_redo(filepath: str, target_id: str | None = None) -> None:
+    idx: dict = _load_vc(filepath)
+    head_id: str | None = idx.get("head")
+    if not head_id or head_id not in idx["commits"]:
+        console.print(f"[error]No commits for {filepath}[/error]")
+        return
+    children: list[str] = [
+        c for c in idx["commits"][head_id].get("children", [])
+        if c in idx["commits"]
+    ]
+    if not children:
+        console.print(f"[error]Already at tip of this branch for {filepath}.[/error]")
+        return
+    if target_id:
+        full_id: str | None = _resolve_commit(filepath, target_id)
+        if not full_id or full_id not in children:
+            console.print(f"[error]Commit {target_id} is not a direct child of HEAD {head_id}.[/error]")
+            return
+        child_id: str = full_id
+    elif len(children) == 1:
+        child_id = children[0]
+    else:
+        rows: list[str] = []
+        for cid in children:
+            c: dict = idx["commits"][cid]
+            rows.append(f"  [bold cyan]{cid}[/bold cyan]  {c['message']}  [dim]{c['timestamp'][:19]}[/dim]")
+        console.print(Panel(
+            "[info]Multiple branches from HEAD. Choose one:\n\n"
+            + "\n".join(rows)
+            + "\n\nUse [bold]/redo " + Path(filepath).name + " <id>[/bold] to select.[/info]",
+            title="Branch", border_style=SAKURA_DEEP,
+        ))
+        return
+    child: dict = idx["commits"][child_id]
+    try:
+        content = Path(child["snapshot"]).read_text(encoding="utf-8")
+    except Exception as exc:
+        console.print(f"[error]Snapshot missing: {exc}[/error]")
+        return
+    Path(filepath).write_text(content, encoding="utf-8")
+    idx["head"] = child_id
+    _save_vc(filepath)
+    console.print(Panel(
+        f"[info]HEAD is now [bold cyan]{child_id}[/bold cyan]\n"
+        f"{child['message']}  [dim]{child['timestamp'][:19]}[/dim][/info]",
+        title="Redo", border_style=SAKURA,
+    ))
 
-def do_commit(filepath: str, message: str) -> None:
+
+def do_checkout(filepath: str, id_prefix: str) -> None:
+    """Check out any commit by ID (full or prefix)."""
+    full_id: str | None = _resolve_commit(filepath, id_prefix)
+    if not full_id:
+        return
+    idx: dict    = _load_vc(filepath)
+    commit: dict = idx["commits"][full_id]
+    try:
+        content: str = Path(commit["snapshot"]).read_text(encoding="utf-8")
+    except Exception as exc:
+        console.print(f"[error]Snapshot missing: {exc}[/error]")
+        return
+    Path(filepath).write_text(content, encoding="utf-8")
+    idx["head"] = full_id
+    _save_vc(filepath)
+    console.print(Panel(
+        f"[info]Checked out [bold cyan]{full_id}[/bold cyan]\n"
+        f"{commit['message']}  [dim]{commit['timestamp'][:19]}[/dim]\n\n"
+        f"Tip: new writes from here will branch.[/info]",
+        title="Checkout", border_style=SAKURA,
+    ))
+
+
+def do_manual_commit(filepath: str, message: str) -> None:
+    """Create an explicit commit of the current file state."""
     path: Path = Path(filepath)
     if not path.exists():
         console.print(f"[error]File not found: {filepath}[/error]")
         return
     content: str = path.read_text(encoding="utf-8")
-    bak: Path    = _snapshot(filepath, content)
-    ts: str      = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    _load_index(filepath)
-    commit_log[filepath].append({"snapshot": str(bak), "message": message or "(no message)", "timestamp": ts})
-    _save_index(filepath)
-    idx: int = len(commit_log[filepath]) - 1
+    cid: str     = _vc_commit(filepath, content, message or None)
+    idx: dict    = _load_vc(filepath)
+    msg: str     = idx["commits"][cid]["message"]
     console.print(Panel(
-        f"[info]Committed [bold]{filepath}[/bold] as #{idx}\nMessage: {message or '(no message)'}\nSnapshot: {bak.name}[/info]",
+        f"[info]Committed [bold]{filepath}[/bold]\n"
+        f"[bold cyan]{cid}[/bold cyan]  {msg}[/info]",
         title="Commit", border_style=SAKURA_DEEP,
     ))
 
 
 def show_log(filepath: str) -> None:
-    _load_index(filepath)
-    entries: list[dict] = commit_log[filepath]
-    if not entries:
-        console.print(f"[info]No commits for {filepath}.[/info]")
-        return
-    rows: list[str] = []
-    for i, entry in enumerate(entries):
-        marker: str = "HEAD" if i == len(entries) - 1 else "    "
-        rows.append(f"  #{i:<3}  {marker}  {entry['timestamp']}  {entry['message']}")
-    console.print(Panel("[info]" + "\n".join(rows) + "[/info]", title=f"Commit log: {filepath}", border_style=SAKURA))
+    """Display the commit tree for filepath."""
+    idx: dict     = _load_vc(filepath)
+    commits: dict = idx.get("commits", {})
+    head_id: str | None = idx.get("head")
+    root_id: str | None = idx.get("root")
 
+    if not commits:
+        console.print(f"[info]No commits recorded for {filepath}.[/info]")
+        return
 
-def do_restore(filepath: str, idx_str: str) -> None:
-    _load_index(filepath)
-    entries: list[dict] = commit_log[filepath]
-    if not entries:
-        console.print(f"[error]No commits for {filepath}.[/error]")
-        return
-    try:
-        idx: int = int(idx_str)
-    except ValueError:
-        console.print("[error]Index must be a number.[/error]")
-        return
-    if idx < 0 or idx >= len(entries):
-        console.print(f"[error]Index {idx} out of range.[/error]")
-        return
-    snap_path: Path = Path(entries[idx]["snapshot"])
-    if not snap_path.exists():
-        console.print(f"[error]Snapshot file missing for commit #{idx}.[/error]")
-        return
-    path: Path = Path(filepath)
-    if path.exists():
-        undo_stack[filepath].append(_snapshot(filepath, path.read_text(encoding="utf-8")))
-        redo_stack[filepath].clear()
-    path.write_text(snap_path.read_text(encoding="utf-8"), encoding="utf-8")
-    _save_index(filepath)
+    # Build tree lines via DFS from root
+    lines: list[str] = []
+
+    def _walk(cid: str, prefix: str, is_last: bool) -> None:
+        c: dict = commits.get(cid, {})
+        if not c:
+            return
+        connector: str   = "\u2514\u2500\u2500 " if is_last else "\u251c\u2500\u2500 "
+        head_tag: str    = "  [bold yellow](HEAD)[/bold yellow]" if cid == head_id else ""
+        root_tag: str    = "  [dim](root)[/dim]" if cid == root_id and cid != head_id else ""
+        branch_tag: str  = ""
+        if len(commits.get(cid, {}).get("children", [])) > 1 or (
+            c.get("parent_id") and
+            len(commits.get(c["parent_id"], {}).get("children", [])) > 1
+        ):
+            branch_tag = "  [dim cyan](branch)[/dim cyan]"
+        lines.append(
+            f"{prefix}{connector}"
+            f"[bold cyan]{cid}[/bold cyan]"
+            f"{head_tag}{root_tag}{branch_tag}  "
+            f"{c.get('message', '?')}  "
+            f"[dim]{c.get('timestamp', '')[:19]}[/dim]"
+        )
+        child_prefix: str    = prefix + ("    " if is_last else "\u2502   ")
+        children: list[str]  = [ch for ch in c.get("children", []) if ch in commits]
+        for i, child_cid in enumerate(children):
+            _walk(child_cid, child_prefix, i == len(children) - 1)
+
+    if root_id and root_id in commits:
+        _walk(root_id, "", True)
+    else:
+        # fallback: show flat list sorted by timestamp
+        for c in sorted(commits.values(), key=lambda x: x.get("timestamp", "")):
+            head_tag = "  (HEAD)" if c["id"] == head_id else ""
+            lines.append(f"[bold cyan]{c['id']}[/bold cyan]{head_tag}  {c['message']}  [dim]{c['timestamp'][:19]}[/dim]")
+
     console.print(Panel(
-        f"[info]Restored [bold]{filepath}[/bold] to commit #{idx}\n"
-        f"Message: {entries[idx]['message']}\nTimestamp: {entries[idx]['timestamp']}\n\nPrevious state saved — use /undo to go back.[/info]",
-        title="Restore", border_style=SAKURA,
+        "\n".join(lines),
+        title=f"Commit tree: {Path(filepath).name}",
+        border_style=SAKURA,
     ))
 
 
 def _all_tracked_files() -> list[str]:
+    """Return all filepaths that have a VC index in VC_DIR."""
     result: list[str] = []
     if not VC_DIR.exists():
         return result
     for slot in sorted(VC_DIR.iterdir()):
-        idx: Path = slot / "index.json"
-        if idx.exists():
+        idx_path: Path = slot / "index.json"
+        if idx_path.exists():
             try:
-                data: dict = json.loads(idx.read_text(encoding="utf-8"))
+                data: dict = json.loads(idx_path.read_text(encoding="utf-8"))
                 fp: str    = data.get("filepath", "")
                 if fp:
                     result.append(fp)
@@ -276,76 +544,7 @@ def _all_tracked_files() -> list[str]:
     return result
 
 
-def _snapshot(filepath: str, content: str) -> Path:
-    slot: Path = _vc_dir_for(filepath)
-    ts: str    = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    bak: Path  = slot / f"{ts}.bak"
-    bak.write_text(content, encoding="utf-8")
-    return bak
-
-
-def write_file_with_vc(filepath: str, new_content: str) -> None:
-    path: Path       = Path(filepath)
-    old_content: str = path.read_text(encoding="utf-8") if path.exists() else ""
-    bak: Path        = _snapshot(filepath, old_content)
-    undo_stack[filepath].append(bak)
-    redo_stack[filepath].clear()
-    _save_index(filepath)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(new_content, encoding="utf-8")
-    lines: int = len(new_content.splitlines())
-    console.print(Panel(
-        f"[info]Wrote {lines} lines to [bold]{filepath}[/bold].\nPrevious version saved. Use /undo to revert.[/info]",
-        title="File written", border_style=SAKURA_DEEP,
-    ))
-
-
-def do_undo(filepath: str) -> None:
-    _load_index(filepath)
-    if not undo_stack[filepath]:
-        console.print(f"[error]Nothing to undo for {filepath}[/error]")
-        return
-    path: Path     = Path(filepath)
-    current: str   = path.read_text(encoding="utf-8") if path.exists() else ""
-    redo_stack[filepath].append(_snapshot(filepath, current))
-    previous: str  = undo_stack[filepath].pop().read_text(encoding="utf-8")
-    path.write_text(previous, encoding="utf-8")
-    _save_index(filepath)
-    console.print(Panel(
-        f"[info]Reverted [bold]{filepath}[/bold] to previous version.\nUse /redo to reapply.[/info]",
-        title="Undo", border_style=SAKURA,
-    ))
-
-
-def do_redo(filepath: str) -> None:
-    _load_index(filepath)
-    if not redo_stack[filepath]:
-        console.print(f"[error]Nothing to redo for {filepath}[/error]")
-        return
-    path: Path     = Path(filepath)
-    current: str   = path.read_text(encoding="utf-8") if path.exists() else ""
-    undo_stack[filepath].append(_snapshot(filepath, current))
-    next_ver: str  = redo_stack[filepath].pop().read_text(encoding="utf-8")
-    path.write_text(next_ver, encoding="utf-8")
-    _save_index(filepath)
-    console.print(Panel(f"[info]Redid change on [bold]{filepath}[/bold].[/info]", title="Redo", border_style=SAKURA))
-
-
-def show_file_history(filepath: str) -> None:
-    _load_index(filepath)
-    all_baks: list = list(enumerate(undo_stack[filepath])) + list(enumerate(redo_stack[filepath]))
-    if not all_baks:
-        console.print(f"[info]No history for {filepath}.[/info]")
-        return
-    rows: list[str] = []
-    for i, bak in enumerate(undo_stack[filepath]):
-        rows.append(f"  undo[{i}]  {bak.stem}  ({bak.stat().st_size} bytes)")
-    for i, bak in enumerate(redo_stack[filepath]):
-        rows.append(f"  redo[{i}]  {bak.stem}  ({bak.stat().st_size} bytes)")
-    console.print(Panel("[info]" + "\n".join(rows) + "[/info]", title=f"History: {filepath}", border_style=SAKURA))
-
-
-# ── General helpers ─────────────────────────────────────────────────────────────────
+# -- General helpers -----------------------------------------------------------
 
 def read_file(path: str) -> str:
     try:
@@ -382,7 +581,7 @@ def resolve_path(arg: str, cwd: str) -> str:
     return str(p) if p.is_absolute() else str(Path(cwd) / p)
 
 
-# ── Partial-write detection ──────────────────────────────────────────────────────────────
+# -- Partial-write detection ---------------------------------------------------
 
 _PARTIAL_PATTERNS: list[re.Pattern] = [
     re.compile(r"^\s*\.{3}\s*$",                       re.MULTILINE),
@@ -398,6 +597,11 @@ _PARTIAL_PATTERNS: list[re.Pattern] = [
     re.compile(r"# \(omitted\)",                        re.IGNORECASE),
 ]
 
+_WRITE_PATTERN: re.Pattern = re.compile(
+    r"<!--\s*WRITE:\s*(?P<path>[^\s>]+)\s*-->\s*```(?:\w+)?\n(?P<code>.*?)```",
+    re.DOTALL,
+)
+
 
 def _reply_has_partial_write(reply: str) -> bool:
     for match in _WRITE_PATTERN.finditer(reply):
@@ -406,12 +610,6 @@ def _reply_has_partial_write(reply: str) -> bool:
             if pat.search(code):
                 return True
     return False
-
-
-_WRITE_PATTERN: re.Pattern = re.compile(
-    r"<!--\s*WRITE:\s*(?P<path>[^\s>]+)\s*-->\s*```(?:\w+)?\n(?P<code>.*?)```",
-    re.DOTALL,
-)
 
 
 def apply_file_writes(reply: str) -> None:
@@ -446,12 +644,12 @@ def apply_command_runs(reply: str, cwd: str, messages: list[dict]) -> None:
         messages.append({"role": "user", "content": f"[Command `{cmd}` was run. Output:]\n```\n{output}\n```"})
 
 
-# ── Tab-completion ──────────────────────────────────────────────────────────────────
+# -- Tab-completion ------------------------------------------------------------
 
 _SLASH_COMMANDS: list[str] = [
     "/cd", "/read", "/run", "/undo", "/redo", "/files",
     "/clear", "/check", "/stackview", "/history", "/help",
-    "/commit", "/log", "/restore",
+    "/commit", "/log", "/checkout",
     "/quit", "/exit", "/q",
 ]
 
@@ -461,7 +659,7 @@ _CMD_SUBARGS: dict[str, list[str]] = {
     "/read":  ["-a"],
 }
 
-_FILE_COMMANDS: set[str] = {"/read", "/check", "/undo", "/redo", "/files", "/cd", "/commit", "/log", "/restore"}
+_FILE_COMMANDS: set[str] = {"/read", "/check", "/undo", "/redo", "/files", "/cd", "/commit", "/log", "/checkout"}
 
 
 def _fuzzy_match(query: str, candidate: str) -> bool:
@@ -520,7 +718,7 @@ if _PT_AVAILABLE:
                     pass
 
 
-# ── Fuzzy hint completions ─────────────────────────────────────────────────────────
+# -- Fuzzy hint completions ----------------------------------------------------
 
 def _get_fuzzy_completions(text: str, cwd: str) -> list[str]:
     if not text.startswith("/"):
@@ -563,8 +761,9 @@ def _get_fuzzy_completions(text: str, cwd: str) -> list[str]:
     return results
 
 
+# -- VT enable -----------------------------------------------------------------
+
 def _enable_windows_vt() -> None:
-    """Enable VT100/ANSI processing on Windows 10+ consoles."""
     if sys.platform != "win32":
         return
     try:
@@ -572,30 +771,27 @@ def _enable_windows_vt() -> None:
         import ctypes.wintypes
         k32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
         k32.GetStdHandle.restype = ctypes.wintypes.HANDLE
-        ENABLE_VIRTUAL_TERMINAL_PROCESSING: int = 0x0004
-        for std_fd in (-10, -11, -12):   # stdin, stdout, stderr
+        ENABLE_VT: int = 0x0004
+        for std_fd in (-10, -11, -12):
             handle = k32.GetStdHandle(ctypes.c_ulong(std_fd))
             mode   = ctypes.wintypes.DWORD(0)
             if k32.GetConsoleMode(handle, ctypes.byref(mode)):
-                k32.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+                k32.SetConsoleMode(handle, mode.value | ENABLE_VT)
     except Exception:
         pass
 
 
+# -- Inline prompt with fuzzy hint above ---------------------------------------
+
 def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
     """
-    Character-by-character prompt with a fuzzy-hint line rendered ABOVE the
-    input line.  Works on Windows (PowerShell / Windows Terminal with VT
-    enabled) and Unix via ANSI escape sequences.
+    Character-by-character prompt.  Hint line appears ONE ROW ABOVE the
+    prompt using ANSI cursor-up (\033[1A).  Works on Windows PowerShell /
+    Windows Terminal (VT enabled) and Unix.
 
-    Layout while typing:
-        [hint line]   /cd ../Soda-Clicker  /cd ../Soda-Autoclicker  ...
-        [prompt line] you (dir): /cd ../S_
-
-    The hint is always kept to exactly ONE terminal line (truncated to fit)
-    so that a single \033[1A always reaches it reliably.
-
-    On Enter the hint row is cleared and the final prompt+input is left.
+    Layout:
+        [hint]   /cd ../Soda-Clicker  /cd ../aurora-user  ...
+        [prompt] you (dir): /cd ../S_
     """
     _enable_windows_vt()
 
@@ -609,12 +805,8 @@ def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
     )
     RESET: str = "\033[0m"
 
-    # ANSI sequences used for the two-row layout:
-    #   \033[1A  → cursor up 1 row
-    #   \r       → carriage return (col 0)
-    #   \033[2K  → erase entire current line
-    UP_CLEAR   = "\033[1A\r\033[2K"   # go up to hint row, col 0, clear it
-    LINE_CLEAR = "\r\033[2K"          # stay on same row, col 0, clear it
+    UP_CLEAR   = "\033[1A\r\033[2K"   # up 1, col 0, erase line
+    LINE_CLEAR = "\r\033[2K"          # col 0, erase current line
 
     buf: list[str]       = []
     hist_idx: int        = len(history)
@@ -624,7 +816,6 @@ def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
         return "".join(buf)
 
     def _build_hint(text: str) -> str:
-        """Return a hint string guaranteed to fit in one terminal line."""
         matches: list[str] = _get_fuzzy_completions(text, cwd)
         if not matches:
             return ""
@@ -639,10 +830,7 @@ def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
                 f"{BOLD}{CYAN}{m}{RESET}" if i == 0 else f"{DIM}{m}{RESET}"
             )
             plain_len += len(sep) + len(m)
-        return "  ".join(
-            re.sub(r"\033\[[^m]*m", "", p) and p or p   # keep styled parts
-            for p in parts_h
-        )
+        return "  ".join(parts_h)
 
     def _tab_complete(text: str) -> str:
         matches: list[str] = _get_fuzzy_completions(text, cwd)
@@ -651,35 +839,22 @@ def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
         best: str = matches[0]
         return best + " " if best in _SLASH_COMMANDS else best
 
-    # ── Initial print: blank hint line + prompt ──────────────────────────────
-    # After this write, cursor is at the END of prompt_str on the PROMPT row.
-    # The blank line above is the HINT row.  \033[1A always reaches it.
+    # Initial print: blank hint line above, prompt below.
     sys.stdout.write("\n" + prompt_str)
     sys.stdout.flush()
 
     def _render(text: str) -> None:
-        """
-        Redraw both rows in place:
-          1. Jump up to hint row, clear it, write new hint.
-          2. Move down to prompt row, clear it, write prompt+text.
-        Cursor ends at column len(prompt_str + text) on the prompt row.
-        """
         hint: str = _build_hint(text)
         sys.stdout.write(
-            UP_CLEAR           # ↑ to hint row, col 0, erase
-            + hint             # write hint (guaranteed single-line width)
-            + "\n"             # ↓ to prompt row (col = end of hint text)
-            + LINE_CLEAR       # col 0, erase prompt row
-            + prompt_str + text
+            UP_CLEAR + hint + "\n" + LINE_CLEAR + prompt_str + text
         )
         sys.stdout.flush()
 
     def _clear_hint() -> None:
-        """Erase the hint row; leave cursor at col 0 of the prompt row."""
         sys.stdout.write(UP_CLEAR + "\n" + LINE_CLEAR)
         sys.stdout.flush()
 
-    # ── Input loop ────────────────────────────────────────────────────────────
+    # Input loop
     try:
         if sys.platform == "win32":
             import msvcrt
@@ -688,21 +863,17 @@ def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
                 ch: str = msvcrt.getwch()  # type: ignore[attr-defined]
 
                 if ch in ("\x00", "\xe0"):
-                    # Extended key prefix
                     ch2: str = msvcrt.getwch()  # type: ignore[attr-defined]
-                    if ch2 == "H":   # up arrow → history back
+                    if ch2 == "H":
                         if hist_idx > 0:
                             if hist_idx == len(history):
                                 saved_buf = buf[:]
                             hist_idx -= 1
                             buf[:] = list(history[hist_idx])
-                    elif ch2 == "P": # down arrow → history forward
+                    elif ch2 == "P":
                         if hist_idx < len(history):
                             hist_idx += 1
-                            buf[:] = list(
-                                history[hist_idx] if hist_idx < len(history)
-                                else saved_buf
-                            )
+                            buf[:] = list(history[hist_idx] if hist_idx < len(history) else saved_buf)
                     _render(_text())
                     continue
 
@@ -711,20 +882,20 @@ def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
                     sys.stdout.write(prompt_str + _text() + "\n")
                     sys.stdout.flush()
                     break
-                elif ch == "\x03":   # Ctrl-C
+                elif ch == "\x03":
                     _clear_hint()
                     sys.stdout.write("\n")
                     sys.stdout.flush()
                     raise KeyboardInterrupt
-                elif ch == "\x04":   # Ctrl-D
+                elif ch == "\x04":
                     _clear_hint()
                     sys.stdout.write("\n")
                     sys.stdout.flush()
                     raise EOFError
-                elif ch in ("\x08", "\x7f"):  # backspace
+                elif ch in ("\x08", "\x7f"):
                     if buf:
                         buf.pop()
-                elif ch == "\t":     # tab complete
+                elif ch == "\t":
                     buf[:] = list(_tab_complete(_text()))
                 else:
                     buf.append(ch)
@@ -775,11 +946,7 @@ def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
                         elif rest == b"[B":
                             if hist_idx < len(history):
                                 hist_idx += 1
-                                buf[:] = list(
-                                    history[hist_idx]
-                                    if hist_idx < len(history)
-                                    else saved_buf
-                                )
+                                buf[:] = list(history[hist_idx] if hist_idx < len(history) else saved_buf)
                     else:
                         try:
                             buf.append(raw.decode("utf-8"))
@@ -798,7 +965,7 @@ def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
     return _text()
 
 
-# ── /check helpers ─────────────────────────────────────────────────────────────────
+# -- /check helpers ------------------------------------------------------------
 
 _CODE_EXTENSIONS: set[str] = {
     ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs",
@@ -885,7 +1052,7 @@ def handle_check(arg: str, messages: list[dict], state: dict) -> None:
         if not source_files:
             console.print(f"[info]No source files found in {cwd}.[/info]")
             return
-        parts: list[str] = []
+        parts_list: list[str] = []
         total_chars: int = 0
         skipped: list[str] = []
         for sf in sorted(source_files):
@@ -897,12 +1064,12 @@ def handle_check(arg: str, messages: list[dict], state: dict) -> None:
             if total_chars + len(content) > 400_000:
                 skipped.append(rel)
                 continue
-            parts.append(f"# ── {rel} ──\n{content}")
+            parts_list.append(f"# -- {rel} --\n{content}")
             total_chars += len(content)
         if skipped:
             console.print(f"[info]Skipped (too large): {', '.join(skipped[:5])}{' ...' if len(skipped) > 5 else ''}[/info]")
-        combined: str   = "\n\n".join(parts)
-        file_count: int = len(parts)
+        combined: str   = "\n\n".join(parts_list)
+        file_count: int = len(parts_list)
         console.print(f"[info]Checking {file_count} file(s) in {_short_cwd(cwd)}...[/info]")
         prompt: str = _build_check_prompt(f"{file_count} file(s) in {cwd}", combined, "workspace")
 
@@ -938,13 +1105,12 @@ def handle_check(arg: str, messages: list[dict], state: dict) -> None:
         save_session(cwd, messages)
 
 
-# ── /stackview ───────────────────────────────────────────────────────────────────────
+# -- /stackview ----------------------------------------------------------------
 
 _SV_TYPES: dict[str, str] = {
     "fh":       "File history  (current project)",
     "fhf":      "File history full (all projects)",
     "sessions": "Saved sessions",
-    "stack":    "Undo/redo stack sizes",
     "env":      "Runtime environment info",
 }
 
@@ -957,9 +1123,17 @@ def _sv_fh(cwd: str) -> None:
         return
     rows: list[str] = []
     for fp in local:
-        _load_index(fp)
-        rows.append(f"  {os.path.relpath(fp, cwd):<40}  ({'exists' if Path(fp).exists() else 'missing':<7})  undo={len(undo_stack[fp])}  redo={len(redo_stack[fp])}")
-    console.print(Panel("[info]" + "\n".join(rows) + "[/info]", title=f"File history  [{_short_cwd(cwd)}]", border_style=SAKURA))
+        idx: dict = _load_vc(fp)
+        commits: dict = idx.get("commits", {})
+        head_id: str | None = idx.get("head")
+        head_msg: str = commits[head_id]["message"][:40] if head_id and head_id in commits else "(no commits)"
+        rows.append(
+            f"  {os.path.relpath(fp, cwd):<36}"
+            f"  {'exists' if Path(fp).exists() else 'missing':<7}"
+            f"  {len(commits)} commits"
+            f"  HEAD: [cyan]{head_id or '-'}[/cyan] {head_msg}"
+        )
+    console.print(Panel("\n".join(rows), title=f"File history [{_short_cwd(cwd)}]", border_style=SAKURA))
 
 
 def _sv_fhf() -> None:
@@ -974,9 +1148,11 @@ def _sv_fhf() -> None:
     for directory in sorted(by_dir):
         rows.append(f"  [{directory}]")
         for fp in sorted(by_dir[directory]):
-            _load_index(fp)
-            rows.append(f"    {Path(fp).name:<36}  ({'exists' if Path(fp).exists() else 'missing':<7})  undo={len(undo_stack[fp])}  redo={len(redo_stack[fp])}")
-    console.print(Panel("[info]" + "\n".join(rows) + "[/info]", title="File history (all projects)", border_style=SAKURA))
+            idx: dict   = _load_vc(fp)
+            n: int      = len(idx.get("commits", {}))
+            exists: str = "exists" if Path(fp).exists() else "missing"
+            rows.append(f"    {Path(fp).name:<36}  {exists:<7}  {n} commits")
+    console.print(Panel("\n".join(rows), title="File history (all projects)", border_style=SAKURA))
 
 
 def _sv_sessions() -> None:
@@ -987,30 +1163,15 @@ def _sv_sessions() -> None:
     for sf in sorted(SESSION_DIR.glob("*.json")):
         try:
             data: dict = json.loads(sf.read_text(encoding="utf-8"))
-            rows.append(f"  {data.get('cwd','?'):<45}  {data.get('saved_at','?')[:19].replace('T','  ')}  {len(data.get('messages',[])):>3} msg  {sf.stat().st_size:>6} B")
+            rows.append(
+                f"  {data.get('cwd','?'):<45}"
+                f"  {data.get('saved_at','?')[:19].replace('T','  ')}"
+                f"  {len(data.get('messages',[])):>3} msg"
+                f"  {sf.stat().st_size:>6} B"
+            )
         except Exception:
             rows.append(f"  {sf.name}  (unreadable)")
-    console.print(Panel("[info]" + "\n".join(rows) + "[/info]", title=f"Saved sessions  ({SESSION_DIR})", border_style=SAKURA))
-
-
-def _sv_stack() -> None:
-    tracked: list[str] = _all_tracked_files()
-    if not tracked:
-        console.print("[info]No tracked files.[/info]")
-        return
-    rows: list[str] = []
-    total_baks: int  = 0
-    total_bytes: int = 0
-    for fp in tracked:
-        _load_index(fp)
-        u: int = len(undo_stack[fp])
-        r: int = len(redo_stack[fp])
-        bb: int = sum(b.stat().st_size for b in undo_stack[fp] + redo_stack[fp] if b.exists())
-        total_baks  += u + r
-        total_bytes += bb
-        rows.append(f"  {fp:<50}  undo={u:<3}  redo={r:<3}  {bb:>8} B stored")
-    rows.append(f"\n  Total: {total_baks} snapshots,  {total_bytes:,} bytes  in {VC_DIR}")
-    console.print(Panel("[info]" + "\n".join(rows) + "[/info]", title="Undo/redo stack", border_style=SAKURA))
+    console.print(Panel("\n".join(rows), title=f"Saved sessions ({SESSION_DIR})", border_style=SAKURA))
 
 
 def _sv_env(cwd: str, messages: list[dict]) -> None:
@@ -1024,7 +1185,7 @@ def _sv_env(cwd: str, messages: list[dict]) -> None:
         f"  Messages     : {len([m for m in messages if m['role'] != 'system'])} in current session",
         f"  Python       : {sys.version.split()[0]}  ({sys.executable})",
     ]
-    console.print(Panel("[info]" + "\n".join(rows) + "[/info]", title="Environment", border_style=SAKURA_DEEP))
+    console.print(Panel("\n".join(rows), title="Environment", border_style=SAKURA_DEEP))
 
 
 def handle_stackview(sv_type: str, cwd: str, messages: list[dict]) -> None:
@@ -1032,17 +1193,16 @@ def handle_stackview(sv_type: str, cwd: str, messages: list[dict]) -> None:
     if t == "fh":                    _sv_fh(cwd)
     elif t == "fhf":                 _sv_fhf()
     elif t in ("sessions", "sess"): _sv_sessions()
-    elif t == "stack":               _sv_stack()
     elif t in ("env", "environment"): _sv_env(cwd, messages)
     elif t in ("", "help"):
         rows: list[str] = [f"  {k:<12}  {v}" for k, v in _SV_TYPES.items()]
         rows += ["  sess        Alias for 'sessions'", "  environment Alias for 'env'"]
-        console.print(Panel("[info]" + "\n".join(rows) + "[/info]", title="/stackview types", border_style=SAKURA_DEEP))
+        console.print(Panel("\n".join(rows), title="/stackview types", border_style=SAKURA_DEEP))
     else:
         console.print(f"[error]Unknown stackview type: '{t}'. Run /stackview help.[/error]")
 
 
-# ── Slash commands ───────────────────────────────────────────────────────────────────
+# -- Slash commands ------------------------------------------------------------
 
 def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
     parts: list[str] = cmd.strip().split(maxsplit=1)
@@ -1124,7 +1284,9 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
         else:
             resolved: str = resolve_path(arg, cwd)
             content: str  = read_file(resolved)
-            state.setdefault("pending_context", []).append(f"Here is the content of `{resolved}`:\n\n```\n{content}\n```")
+            state.setdefault("pending_context", []).append(
+                f"Here is the content of `{resolved}`:\n\n```\n{content}\n```"
+            )
             console.print(f"[info]Loaded {resolved} into context.[/info]")
 
     elif name == "/run":
@@ -1136,42 +1298,80 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
             console.print(Panel(output, title=f"$ {arg}", border_style=SAKURA_MUTED))
 
     elif name == "/undo":
+        # Usage: /undo [filepath]
         if not arg:
             tracked: list[str] = _all_tracked_files()
-            candidates: list[str] = [fp for fp in tracked if (_load_index(fp) or True) and undo_stack[fp]]
-            if not candidates:       console.print("[info]No undo history.[/info]")
+            candidates: list[str] = [
+                fp for fp in tracked
+                if _load_vc(fp).get("head") and
+                _load_vc(fp)["commits"].get(_load_vc(fp)["head"], {}).get("parent_id")
+            ]
+            if not candidates:         console.print("[info]Nothing to undo.[/info]")
             elif len(candidates) == 1: do_undo(candidates[0])
             else:
-                console.print("[info]Multiple files have undo history. Specify one:[/info]")
-                for fp in candidates: console.print(f"[info]  /undo {fp}[/info]")
+                console.print("[info]Multiple files. Specify one:[/info]")
+                for fp in candidates: console.print(f"  [info]/undo {fp}[/info]")
         else:
-            do_undo(arg)
+            do_undo(resolve_path(arg.split()[0], cwd))
 
     elif name == "/redo":
-        if not arg:
+        # Usage: /redo [filepath] [commit_id]
+        tokens: list[str] = arg.split(maxsplit=1) if arg else []
+        if not tokens:
             tracked = _all_tracked_files()
-            candidates = [fp for fp in tracked if (_load_index(fp) or True) and redo_stack[fp]]
-            if not candidates:       console.print("[info]No redo history.[/info]")
+            candidates = [
+                fp for fp in tracked
+                if _load_vc(fp).get("head") and
+                _load_vc(fp)["commits"].get(_load_vc(fp)["head"], {}).get("children")
+            ]
+            if not candidates:         console.print("[info]Nothing to redo.[/info]")
             elif len(candidates) == 1: do_redo(candidates[0])
             else:
-                console.print("[info]Multiple files have redo history. Specify one:[/info]")
-                for fp in candidates: console.print(f"[info]  /redo {fp}[/info]")
+                console.print("[info]Multiple files. Specify one:[/info]")
+                for fp in candidates: console.print(f"  [info]/redo {fp}[/info]")
+        elif len(tokens) == 1:
+            do_redo(resolve_path(tokens[0], cwd))
         else:
-            do_redo(arg)
+            do_redo(resolve_path(tokens[0], cwd), target_id=tokens[1])
+
+    elif name == "/checkout":
+        # Usage: /checkout <commit_id> [filepath]
+        if not arg:
+            console.print("[error]Usage: /checkout <commit_id> [filepath][/error]")
+        else:
+            tokens = arg.split(maxsplit=1)
+            commit_id_arg: str = tokens[0]
+            fp_arg: str | None = tokens[1] if len(tokens) > 1 else None
+            if fp_arg:
+                do_checkout(resolve_path(fp_arg, cwd), commit_id_arg)
+            else:
+                # Try to find which file has this commit
+                tracked = _all_tracked_files()
+                found: list[str] = []
+                for fp in tracked:
+                    idx: dict = _load_vc(fp)
+                    if any(c.startswith(commit_id_arg) for c in idx.get("commits", {})):
+                        found.append(fp)
+                if len(found) == 1:
+                    do_checkout(found[0], commit_id_arg)
+                elif len(found) > 1:
+                    console.print(f"[info]Commit ID matches multiple files. Specify filepath:[/info]")
+                    for fp in found: console.print(f"  /checkout {commit_id_arg} {fp}")
+                else:
+                    console.print(f"[error]Commit '{commit_id_arg}' not found in any tracked file.[/error]")
 
     elif name == "/files":
-        if arg:
-            show_file_history(arg)
+        tracked = _all_tracked_files()
+        if not tracked:
+            console.print("[info]No tracked files.[/info]")
         else:
-            tracked = _all_tracked_files()
-            if not tracked:
-                console.print("[info]No tracked files.[/info]")
-            else:
-                rows: list[str] = []
-                for fp in tracked:
-                    _load_index(fp)
-                    rows.append(f"  {fp}  ({'exists' if Path(fp).exists() else 'missing'})  undo={len(undo_stack[fp])}  redo={len(redo_stack[fp])}")
-                console.print(Panel("[info]" + "\n".join(rows) + "[/info]", title="Tracked files", border_style=SAKURA))
+            rows: list[str] = []
+            for fp in tracked:
+                idx = _load_vc(fp)
+                n   = len(idx.get("commits", {}))
+                hid = idx.get("head", "-")
+                rows.append(f"  {fp}  {'exists' if Path(fp).exists() else 'missing'}  {n} commits  HEAD={hid}")
+            console.print(Panel("\n".join(rows), title="Tracked files", border_style=SAKURA))
 
     elif name == "/check":
         if not arg: console.print("[error]Usage: /check ALL | /check <file> | /check <file>:<function>[/error]")
@@ -1181,21 +1381,25 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
         handle_stackview(arg, cwd, messages)
 
     elif name == "/commit":
-        if not arg: console.print("[error]Usage: /commit <file> [message][/error]")
+        # Usage: /commit [filepath] [message]
+        if not arg:
+            console.print("[error]Usage: /commit <filepath> [message][/error]")
         else:
-            tokens: list[str] = arg.split(maxsplit=1)
-            do_commit(resolve_path(tokens[0], cwd), tokens[1] if len(tokens) > 1 else "")
+            tokens = arg.split(maxsplit=1)
+            fp_c: str  = resolve_path(tokens[0], cwd)
+            msg_c: str = tokens[1] if len(tokens) > 1 else ""
+            do_manual_commit(fp_c, msg_c)
 
     elif name == "/log":
-        if not arg: console.print("[error]Usage: /log <file>[/error]")
-        else:       show_log(resolve_path(arg.split()[0], cwd))
-
-    elif name == "/restore":
-        if not arg: console.print("[error]Usage: /restore <file> <commit-index>[/error]")
+        if not arg:
+            tracked = _all_tracked_files()
+            if not tracked: console.print("[info]No tracked files.[/info]")
+            elif len(tracked) == 1: show_log(tracked[0])
+            else:
+                console.print("[info]Multiple files. Specify one:[/info]")
+                for fp in tracked: console.print(f"  /log {fp}")
         else:
-            rt: list[str] = arg.split(maxsplit=1)
-            if len(rt) < 2: console.print("[error]Usage: /restore <file> <commit-index>[/error]")
-            else:           do_restore(resolve_path(rt[0], cwd), rt[1].strip())
+            show_log(resolve_path(arg.split()[0], cwd))
 
     elif name == "/history":
         for i, m in enumerate(messages):
@@ -1204,25 +1408,24 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
     elif name == "/help":
         console.print(Panel(textwrap.dedent("""\
             Available commands:
-              /cd [dir]         - change working directory (no arg = show current)
-              /read <file>      - load a file into the conversation context
-              /read -a          - load ALL files in the tree recursively (up to 400 KB)
-              /run <cmd>        - run a shell command and add output to context
-              /undo [file]      - revert the last AI-written file edit
-              /redo [file]      - re-apply a reverted edit
-              /files [file]     - list tracked files, or show history for one file
-              /clear            - clear conversation history
-              /check <target>   - AI code review
-                  ALL           review all source files in cwd
-                  file.py       review a single file
-                  file.py:func  review a single function
-              /stackview <type> - view stacks/sessions/env info
-              /commit <file> [msg] - tag the current file state with a message
-              /log <file>       - show named commit log for a file
-              /restore <file> <#> - restore file to a specific commit index
-              /history          - show message history
-              /help             - show this help
-              /quit             - exit
+              /cd [dir]              change working directory
+              /read <file>           load file into context
+              /read -a               load ALL files recursively (up to 400 KB)
+              /run <cmd>             run a shell command
+              /clear                 clear conversation history
+              /check <target>        AI code review (ALL | file | file:func)
+              /stackview <type>      view fh / fhf / sessions / env
+              /history               show message history
+              /help                  show this help
+              /quit                  exit
+
+            Version control (git-like):
+              /undo [file]           move HEAD to parent commit
+              /redo [file] [id]      move HEAD to child (menu if branched)
+              /checkout <id> [file]  check out any commit by ID
+              /commit <file> [msg]   manually commit current file state
+              /log [file]            show commit tree
+              /files                 list all tracked files
         """), title="Help", border_style=SAKURA_DEEP))
 
     else:
@@ -1231,7 +1434,7 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
     return True
 
 
-# ── Response rendering ────────────────────────────────────────────────────────────────
+# -- Response rendering --------------------------------------------------------
 
 def render_response(text: str) -> None:
     _CODE_BLOCK_RE = re.compile(r"(```(?:\w+)?\n.*?```)", re.DOTALL)
@@ -1261,7 +1464,7 @@ def render_response(text: str) -> None:
                 console.print(Markdown(cleaned))
 
 
-# ── Streaming ────────────────────────────────────────────────────────────────────
+# -- Streaming -----------------------------------------------------------------
 
 def _watch_for_cancel(cancel_event: threading.Event) -> None:
     try:
@@ -1363,7 +1566,7 @@ def stream_response(messages: list[dict], cwd: str = "") -> str:
     return full_reply
 
 
-# ── Main loop ─────────────────────────────────────────────────────────────────
+# -- Main loop -----------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="qwen3-code")
