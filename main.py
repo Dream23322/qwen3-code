@@ -5,6 +5,7 @@ Settings are read from / saved to settings.json next to this file.
 """
 
 import argparse
+import contextlib
 import difflib
 import hashlib
 import json
@@ -18,6 +19,7 @@ import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
+from typing import Generator
 
 try:
     import ollama
@@ -29,8 +31,8 @@ try:
     from rich.console import Console
     from rich.markdown import Markdown
     from rich.panel import Panel
-    from rich.table import Table
     from rich.syntax import Syntax
+    from rich.table import Table
     from rich.theme import Theme
     from rich.text import Text
 except ImportError:
@@ -62,7 +64,7 @@ _SETTINGS_HELP: dict[str, str] = {
     "app_name":               "Display name shown in the header and panels",
     "assistant_name":         "Label used when the AI is thinking / responding",
     "model":                  "Ollama model tag to use for all inference",
-    "open_from_last_session": "true/false  — resume previous conversation on startup",
+    "open_from_last_session": "true/false  \u2014 resume previous conversation on startup",
 }
 
 
@@ -80,21 +82,23 @@ def save_settings(settings: dict) -> None:
     SETTINGS_PATH.write_text(json.dumps(settings, indent=2), encoding="utf-8")
 
 
-# Load once at import time; mutated by /settings command.
 CFG: dict = load_settings()
 
-# Convenience aliases — read these everywhere instead of the old MODULE constant.
+
 def _model()          -> str:  return CFG["model"]
 def _app_name()       -> str:  return CFG["app_name"]
 def _assistant_name() -> str:  return CFG["assistant_name"]
 
 # ---------------------------------------------------------------------------
-# Other constants
+# Constants
 # ---------------------------------------------------------------------------
 
 VC_DIR: Path      = Path.home() / ".local" / "share" / "qwen3-code" / "vc"
 SESSION_DIR: Path = Path.home() / ".local" / "share" / "qwen3-code" / "sessions"
 STREAM_MAX_LINES: int = 10
+
+# If the new file content is this fraction smaller than the original, warn the user.
+SIZE_REDUCTION_THRESHOLD: float = 0.20
 
 _PARTIAL_REPROMPT: str = (
     "Your last response contained a partial file (it included truncation markers like "
@@ -152,6 +156,42 @@ custom_theme: Theme = Theme({
 console: Console = Console(theme=custom_theme)
 
 # ---------------------------------------------------------------------------
+# Animated spinner (used while waiting for blocking calls)
+# ---------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def _spinning_dots(message: str) -> Generator[None, None, None]:
+    """Show an animated '...' spinner on a single stdout line.
+
+    The spinner runs in a daemon thread so the main thread can do blocking
+    work.  On exit the line is cleared and the cursor left at column 0 so
+    the caller can print the result cleanly.
+    """
+    stop_event: threading.Event = threading.Event()
+
+    frames: list[str] = ["   ", ".  ", ".. ", "..."]
+
+    def _spin() -> None:
+        i: int = 0
+        while not stop_event.is_set():
+            sys.stdout.write(f"\r  {message}{frames[i % len(frames)]}")
+            sys.stdout.flush()
+            i += 1
+            time.sleep(0.25)
+        # Clear the line.
+        sys.stdout.write("\r" + " " * (len(message) + 8) + "\r")
+        sys.stdout.flush()
+
+    t: threading.Thread = threading.Thread(target=_spin, daemon=True)
+    t.start()
+    try:
+        yield
+    finally:
+        stop_event.set()
+        t.join(timeout=1.0)
+
+
+# ---------------------------------------------------------------------------
 # Help table
 # ---------------------------------------------------------------------------
 
@@ -201,17 +241,9 @@ def _help_table() -> Table:
 # ---------------------------------------------------------------------------
 
 def handle_settings(arg: str) -> None:
-    """Show all settings, or set a single key.
-
-    Usage:
-        /settings                     — print current values
-        /settings <key>               — print one value
-        /settings <key> <value>       — update one value
-    """
     parts: list[str] = arg.strip().split(maxsplit=1)
 
     if not parts:
-        # Display all current settings.
         rows: list[str] = []
         for k, v in CFG.items():
             default_tag = " [dim](default)[/dim]" if v == DEFAULT_SETTINGS.get(k) else ""
@@ -229,14 +261,12 @@ def handle_settings(arg: str) -> None:
 
     key: str = parts[0].lower()
 
-    # Validate key.
     if key not in DEFAULT_SETTINGS:
         valid: str = ", ".join(DEFAULT_SETTINGS.keys())
         console.print(f"[error]Unknown setting '{key}'. Valid keys: {valid}[/error]")
         return
 
     if len(parts) == 1:
-        # Just show the one setting.
         console.print(
             f"[bold cyan]{key}[/bold cyan] = [bold]{CFG[key]}[/bold]  "
             f"[dim]{_SETTINGS_HELP.get(key, '')}[/dim]"
@@ -244,8 +274,6 @@ def handle_settings(arg: str) -> None:
         return
 
     raw_val: str = parts[1].strip()
-
-    # Type coercion.
     expected = DEFAULT_SETTINGS[key]
     if isinstance(expected, bool):
         if raw_val.lower() in ("true", "1", "yes", "on"):
@@ -269,10 +297,8 @@ def handle_settings(arg: str) -> None:
     save_settings(CFG)
     console.print(
         f"[info][bold cyan]{key}[/bold cyan]: "
-        f"[dim]{old_val}[/dim] → [bold]{value}[/bold]  saved to {SETTINGS_PATH}[/info]"
+        f"[dim]{old_val}[/dim] \u2192 [bold]{value}[/bold]  saved to {SETTINGS_PATH}[/info]"
     )
-
-    # Notify if model changed — user may need to pull it.
     if key == "model":
         console.print(
             f"[info]Model changed. Make sure it is available locally:\n"
@@ -388,6 +414,7 @@ def _make_commit_id(filepath: str, content: str, ts: str) -> str:
 
 
 def _generate_commit_message(filepath: str, old_content: str, new_content: str) -> str:
+    """Ask the model for a commit message while showing an animated spinner."""
     fname: str           = Path(filepath).name
     old_lines: list[str] = old_content.splitlines()
     new_lines: list[str] = new_content.splitlines()
@@ -405,20 +432,32 @@ def _generate_commit_message(filepath: str, old_content: str, new_content: str) 
         f"Reply with ONLY the commit message text, no quotes, no explanation.\n\n"
         f"```diff\n{snippet}\n```"
     )
-    console.print(f"[info]Generating commit message...[/info]", end="")
-    try:
-        resp = ollama.chat(
-            model=_model(),
-            messages=[{"role": "user", "content": prompt}],
-            stream=False,
-        )
-        msg: str = resp["message"]["content"].strip().split("\n")[0]
-        msg = msg.strip("\"'`")[:72]
-        console.print(f" [bold]{msg}[/bold]")
-        return msg or f"Update {fname}"
-    except Exception:
+
+    result: dict = {"msg": None, "error": None}
+
+    def _call() -> None:
+        try:
+            resp = ollama.chat(
+                model=_model(),
+                messages=[{"role": "user", "content": prompt}],
+                stream=False,
+            )
+            msg: str = resp["message"]["content"].strip().split("\n")[0]
+            result["msg"] = msg.strip("\"'`")[:72]
+        except Exception as exc:
+            result["error"] = exc
+
+    with _spinning_dots("Generating commit message"):
+        t: threading.Thread = threading.Thread(target=_call, daemon=True)
+        t.start()
+        t.join()
+
+    if result["msg"]:
+        console.print(f"  [dim]commit:[/dim] [bold]{result['msg']}[/bold]")
+        return result["msg"]
+    else:
         fallback: str = f"Update {fname} (+{added}/-{removed} lines)"
-        console.print(f" [dim]{fallback}[/dim]")
+        console.print(f"  [dim]{fallback}[/dim]")
         return fallback
 
 
@@ -479,6 +518,62 @@ def _vc_baseline(filepath: str) -> None:
     console.print(f"[info]Baseline snapshot saved for [bold]{Path(resolved).name}[/bold][/info]")
 
 
+# ---------------------------------------------------------------------------
+# Size-reduction confirmation
+# ---------------------------------------------------------------------------
+
+def _confirm_size_reduction(
+    filepath: str,
+    old_content: str,
+    new_content: str,
+    reduction: float,
+) -> bool:
+    """Show a diff and ask the user whether to keep the smaller new content.
+
+    Returns True if the user confirms the write, False to cancel it.
+    """
+    old_lines: list[str] = old_content.splitlines()
+    new_lines: list[str] = new_content.splitlines()
+    diff: list[str] = list(difflib.unified_diff(
+        old_lines, new_lines,
+        fromfile="current", tofile="new (proposed)",
+        lineterm="", n=3,
+    ))
+
+    console.print(Panel(
+        f"[bold yellow]\u26a0  Large size reduction detected[/bold yellow]\n\n"
+        f"  File    : [bold]{filepath}[/bold]\n"
+        f"  Before  : {len(old_content):,} chars  ({len(old_lines)} lines)\n"
+        f"  After   : {len(new_content):,} chars  ({len(new_lines)} lines)\n"
+        f"  Reduced : [bold red]{reduction * 100:.1f}%[/bold red]",
+        title="Write guard",
+        border_style=SAKURA_DARK,
+    ))
+
+    if diff:
+        snippet: str = "\n".join(diff[:80])
+        if len(diff) > 80:
+            snippet += f"\n\u2026 ({len(diff) - 80} more diff lines not shown)"
+        console.print(Panel(
+            Syntax(snippet, "diff", theme="dracula"),
+            title="Diff  (current \u2192 proposed)",
+            border_style=SAKURA_MUTED,
+        ))
+    else:
+        console.print("[info](no textual diff available)[/info]")
+
+    try:
+        answer: str = input("Write anyway? [y/N] ").strip().lower()
+        return answer in ("y", "yes")
+    except (KeyboardInterrupt, EOFError):
+        console.print("[info]Write cancelled.[/info]")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# File writer with VC
+# ---------------------------------------------------------------------------
+
 def write_file_with_vc(
     filepath: str,
     new_content: str,
@@ -486,11 +581,26 @@ def write_file_with_vc(
 ) -> None:
     resolved: str = str(Path(filepath).resolve())
 
+    # ---- 1. Baseline if the file is not yet tracked -----------------------
     if Path(resolved).exists():
         idx_check: dict = _load_vc(resolved)
         if not idx_check.get("head"):
             _vc_baseline(resolved)
 
+    # ---- 2. Size-reduction guard ------------------------------------------
+    if Path(resolved).exists():
+        try:
+            existing: str = Path(resolved).read_text(encoding="utf-8")
+            if len(existing) > 0:
+                reduction: float = (len(existing) - len(new_content)) / len(existing)
+                if reduction > SIZE_REDUCTION_THRESHOLD:
+                    if not _confirm_size_reduction(resolved, existing, new_content, reduction):
+                        console.print("[info]Write cancelled by user.[/info]")
+                        return
+        except Exception:
+            pass  # unreadable / binary file — proceed without check
+
+    # ---- 3. Write & commit ------------------------------------------------
     path: Path = Path(filepath)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(new_content, encoding="utf-8")
@@ -1357,6 +1467,7 @@ def _sv_env(cwd: str, messages: list[dict]) -> None:
         f"  Assistant name    : {_assistant_name()}",
         f"  Resume session    : {CFG.get('open_from_last_session')}",
         f"  Settings file     : {SETTINGS_PATH}  ({'exists' if SETTINGS_PATH.exists() else 'not created yet'})",
+        f"  Size-reduction \u26a0  : >{SIZE_REDUCTION_THRESHOLD*100:.0f}% triggers confirmation",
         f"  CWD               : {cwd}",
         f"  VC dir            : {VC_DIR}",
         f"  Session dir       : {SESSION_DIR}",
@@ -1684,10 +1795,6 @@ def _raw_stream(
     messages: list[dict],
     cancel_event: threading.Event | None = None,
 ) -> tuple[str, int]:
-    """
-    Stream tokens with a rolling STREAM_MAX_LINES-line window.
-    Returns (full_text, rendered_rows).
-    """
     full: str          = ""
     window: list[str]  = []
     partial: str       = ""
@@ -1753,12 +1860,10 @@ def stream_response(messages: list[dict], cwd: str = "") -> str:
     watcher.start()
     full_reply, window_rows = _raw_stream(messages, cancel_event)
 
-    # Capture whether the USER cancelled before we set the event ourselves.
     user_cancelled: bool = cancel_event.is_set()
-    cancel_event.set()   # stop watcher regardless
+    cancel_event.set()
     watcher.join(timeout=0.5)
 
-    # Clear stream window + blank line + status bar.
     clear_rows: int = max(2, window_rows + 1)
     sys.stdout.write(f"\033[{clear_rows}A\r\033[J")
     sys.stdout.flush()
@@ -1769,8 +1874,7 @@ def stream_response(messages: list[dict], cwd: str = "") -> str:
         return full_reply
 
     if user_cancelled:
-        # Show whatever came through, but DO NOT write files or run commands.
-        console.print("[info]Cancelled — partial response shown, no files written.[/info]")
+        console.print("[info]Cancelled \u2014 partial response shown, no files written.[/info]")
         render_response(full_reply)
         return full_reply
 
@@ -1799,9 +1903,8 @@ def stream_response(messages: list[dict], cwd: str = "") -> str:
             full_reply = rr
 
     render_response(full_reply)
-    if not user_cancelled:
-        apply_file_writes(full_reply)
-        apply_command_runs(full_reply, cwd, messages)
+    apply_file_writes(full_reply)
+    apply_command_runs(full_reply, cwd, messages)
     return full_reply
 
 
@@ -1876,14 +1979,9 @@ def main() -> None:
 
         messages.append({"role": "user", "content": content})
         reply: str = stream_response(messages, cwd)
-        if reply and not cancel_event_was_set_check(reply):
+        if reply:
             messages.append({"role": "assistant", "content": reply})
             save_session(cwd, messages)
-
-
-def cancel_event_was_set_check(reply: str) -> bool:
-    """Dummy — reply is always appended; kept for clarity in main loop."""
-    return False
 
 
 if __name__ == "__main__":
