@@ -96,8 +96,18 @@ def _assistant_name() -> str:  return CFG["assistant_name"]
 
 VC_DIR: Path      = Path.home() / ".local" / "share" / "qwen3-code" / "vc"
 SESSION_DIR: Path = Path.home() / ".local" / "share" / "qwen3-code" / "sessions"
-STREAM_MAX_LINES: int   = 10
+STREAM_MAX_LINES: int        = 10
 SIZE_REDUCTION_THRESHOLD: float = 0.20
+
+# Directories skipped during /read -a  (content not read, but their presence
+# is noted in the context so the AI knows they exist).
+_IGNORED_DIRS: set[str] = {
+    ".venv", "venv", ".env", "env",
+    "node_modules", "__pycache__", ".git", ".hg", ".svn",
+    "dist", "build", ".next", ".nuxt", ".tox",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    "coverage", ".eggs", "*.egg-info",
+}
 
 _PARTIAL_REPROMPT: str = (
     "Your last response contained a partial file (it included truncation markers like "
@@ -209,9 +219,9 @@ def _help_table() -> Table:
         ("[bold]General[/bold]", ""),
         ("/cd [dir]",             "change working directory"),
         ("/read <file>",          f"load file into context  {D}(saves baseline snapshot){E}"),
-        ("/read -a",              f"load ALL files recursively  {D}(saves baseline snapshots){E}"),
+        ("/read -a",              f"load ALL files recursively  {D}(skips venv/node_modules etc){E}"),
         ("/refresh",              f"reload tracked files, prune stale context  {D}(gone files removed){E}"),
-        ("/run <cmd>",            "run a shell command"),
+        ("/run <cmd>",            "run a shell command  [dim](output streams live)[/dim]"),
         ("/clear",                "clear conversation history"),
         ("/check <target>",       f"AI code review  {D}ALL | file | file:func{E}"),
         ("/stackview <type>",     f"inspect state  {D}fh / fhf / sessions / env{E}"),
@@ -227,10 +237,6 @@ def _help_table() -> Table:
         ("/commit <file> [msg]",  "manually commit current file state"),
         ("/log [file]",           "show commit tree"),
         ("/files",                "list all tracked files"),
-        ("", ""),
-        ("[bold]Workflow[/bold]", ""),
-        ("/read file.py",         f"{D}baseline snapshot created{E}"),
-        ("ask AI to edit",        f"{D}AI writes \u2192 diff vs baseline \u2192 AI commit msg{E}"),
     ]
 
     for cmd_text, desc_text in rows:
@@ -992,16 +998,51 @@ def read_file(path: str) -> str:
         return f"[could not read file: {exc}]"
 
 
-def run_command(cmd: str) -> str:
+def run_command(cmd: str, cwd: str = "") -> str:
+    """Run a shell command silently (no live output). Returns full output string."""
     try:
         result: subprocess.CompletedProcess = subprocess.run(
             cmd, shell=True, capture_output=True, text=True, timeout=30,
+            cwd=cwd or None,
         )
         return (result.stdout + result.stderr).strip() or "(no output)"
     except subprocess.TimeoutExpired:
         return "[command timed out after 30 s]"
     except Exception as exc:
         return f"[command error: {exc}]"
+
+
+def run_command_live(cmd: str, cwd: str = "") -> str:
+    """Run a shell command, streaming each line to stdout as it arrives.
+    Returns the full output as a string for injecting back into the conversation."""
+    lines: list[str] = []
+    console.print(Panel(
+        f"[bold]$ {cmd}[/bold]",
+        title="Running", border_style=SAKURA_MUTED,
+    ))
+    try:
+        proc = subprocess.Popen(
+            cmd, shell=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+            cwd=cwd or None,
+        )
+        assert proc.stdout is not None
+        for raw_line in proc.stdout:
+            sys.stdout.write(raw_line)
+            sys.stdout.flush()
+            lines.append(raw_line)
+        proc.wait()
+        rc: int = proc.returncode
+    except Exception as exc:
+        err: str = f"[command error: {exc}]"
+        console.print(f"[error]{err}[/error]")
+        return err
+
+    output: str = "".join(lines).strip() or "(no output)"
+    status_style: str = SAKURA if rc == 0 else SAKURA_DARK
+    console.print(f"[{status_style}]{'\u2713 done' if rc == 0 else f'exit {rc}'}[/{status_style}]")
+    return output
 
 
 def build_context_snippet(cwd: str) -> str:
@@ -1062,6 +1103,7 @@ _RUN_PATTERN: re.Pattern = re.compile(r"<!--\s*RUN:\s*(?P<cmd>[^>]+?)\s*-->", re
 
 
 def apply_command_runs(reply: str, cwd: str, messages: list[dict]) -> None:
+    """Apply <!-- RUN: cmd --> markers, streaming output live."""
     for match in _RUN_PATTERN.finditer(reply):
         cmd: str = match.group("cmd").strip()
         if not cmd:
@@ -1079,9 +1121,7 @@ def apply_command_runs(reply: str, cwd: str, messages: list[dict]) -> None:
             console.print("[info]Command skipped.[/info]")
             messages.append({"role": "user", "content": f"[Command `{cmd}` was denied by the user.]"})
             continue
-        console.print(f"[info]Running: {cmd}[/info]")
-        output: str = run_command(cmd)
-        console.print(Panel(output, title=f"$ {cmd}", border_style=SAKURA_MUTED))
+        output: str = run_command_live(cmd, cwd)
         messages.append({"role": "user", "content": f"[Command `{cmd}` was run. Output:]\n```\n{output}\n```"})
 
 
@@ -1474,6 +1514,7 @@ def handle_check(arg: str, messages: list[dict], state: dict) -> None:
                 f for f in Path(cwd).rglob("*")
                 if f.is_file() and f.suffix.lower() in _CODE_EXTENSIONS
                 and not any(part.startswith(".") for part in f.parts)
+                and not any(part in _IGNORED_DIRS for part in f.parts)
             ]
         except Exception as exc:
             console.print(f"[error]Could not scan directory: {exc}[/error]")
@@ -1689,11 +1730,27 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
         if not arg:
             console.print("[error]Usage: /read <filepath> | /read -a[/error]")
         elif arg.strip() == "-a":
+            # Walk tree manually so we can skip _IGNORED_DIRS without
+            # descending into them, while still noting they exist.
+            ignored_found: set[str] = set()
+            all_files: list[Path]   = []
             try:
-                all_files: list[Path] = [
-                    f for f in Path(cwd).rglob("*")
-                    if f.is_file() and not any(part.startswith(".") for part in f.parts)
-                ]
+                for root_str, dirs, files in os.walk(cwd):
+                    root_path: Path    = Path(root_str)
+                    rel_parts: tuple   = root_path.relative_to(cwd).parts
+
+                    # Prune dirs in-place so os.walk won't descend into them.
+                    to_remove: list[str] = []
+                    for d in dirs:
+                        if d.startswith(".") or d in _IGNORED_DIRS:
+                            ignored_found.add(d)
+                            to_remove.append(d)
+                    for d in to_remove:
+                        dirs.remove(d)
+
+                    for fname in files:
+                        if not fname.startswith("."):
+                            all_files.append(root_path / fname)
             except Exception as exc:
                 console.print(f"[error]Could not scan directory: {exc}[/error]")
             else:
@@ -1718,12 +1775,24 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
                 if skipped:
                     console.print("[info]Skipped: " + ", ".join(skipped[:5]) + (" ..." if len(skipped) > 5 else "") + "[/info]")
                 if snippets:
+                    # Append a note about ignored dirs so the AI knows they exist.
+                    ignored_note: str = ""
+                    if ignored_found:
+                        dirs_list: str = ", ".join(f"{d}/" for d in sorted(ignored_found))
+                        ignored_note   = (
+                            f"\n\n[Note: the following directories exist but their "
+                            f"contents were not loaded (dependencies / generated / VCS): "
+                            f"{dirs_list}]"
+                        )
                     state.setdefault("pending_context", []).append(
-                        f"Here are all {len(snippets)} file(s) from `{cwd}`:\n\n" + "\n\n".join(snippets)
+                        f"Here are all {len(snippets)} file(s) from `{cwd}`:\n\n"
+                        + "\n\n".join(snippets)
+                        + ignored_note
                     )
                     console.print(
                         f"[info]Loaded {len(snippets)} file(s) into context"
                         + (f", saved {baselined} baseline snapshot(s)." if baselined else ".")
+                        + (f"  [dim]Noted {len(ignored_found)} ignored dir(s).[/dim]" if ignored_found else "")
                         + "[/info]"
                     )
                 else:
@@ -1749,9 +1818,8 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
         if not arg:
             console.print("[error]Usage: /run <shell command>[/error]")
         else:
-            output: str = run_command(arg)
+            output: str = run_command_live(arg, cwd)
             messages.append({"role": "user", "content": f"Output of `{arg}`:\n\n```\n{output}\n```"})
-            console.print(Panel(output, title=f"$ {arg}", border_style=SAKURA_MUTED))
 
     elif name == "/undo":
         if not arg:
@@ -2042,19 +2110,16 @@ def stream_response(messages: list[dict], cwd: str = "") -> str:
     sys.stdout.write(f"\033[{clear_rows}A\r\033[J")
     sys.stdout.flush()
 
-    # ---- Empty response --------------------------------------------------
     if not full_reply:
         if user_cancelled:
             console.print("[info]Cancelled.[/info]")
         return full_reply
 
-    # ---- Cancelled during initial stream — show text, skip all writes ----
     if user_cancelled:
         console.print("[info]Cancelled \u2014 partial response shown, no files written.[/info]")
         render_response(full_reply)
         return full_reply
 
-    # ---- Partial-write detected — retry, but honour Ctrl+D again ---------
     if _reply_has_partial_write(full_reply):
         console.print(Panel(
             "[info]Partial file detected. Reprompting...[/info]",
@@ -2076,12 +2141,10 @@ def stream_response(messages: list[dict], cwd: str = "") -> str:
         clear_rows_r = max(2, rw_rows + 1)
         sys.stdout.write(f"\033[{clear_rows_r}A\r\033[J")
         sys.stdout.flush()
-        # Always pop the temporary retry messages
         messages.pop()
         messages.pop()
 
         if rc_cancelled:
-            # User cancelled during retry — show whatever we got, no writes
             console.print("[info]Cancelled \u2014 partial response shown, no files written.[/info]")
             render_response(rr or full_reply)
             return rr or full_reply
@@ -2089,7 +2152,6 @@ def stream_response(messages: list[dict], cwd: str = "") -> str:
         if rr:
             full_reply = rr
 
-    # ---- Normal path — render then apply writes/runs ---------------------
     render_response(full_reply)
     apply_file_writes(full_reply)
     apply_command_runs(full_reply, cwd, messages)
