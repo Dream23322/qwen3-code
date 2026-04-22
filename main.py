@@ -171,6 +171,13 @@ def load_session(cwd: str) -> list[dict]:
 #
 # The index for a file stores all commits + current HEAD pointer.
 # Branching happens naturally: /undo then a new write creates a branch.
+#
+# Baseline snapshots
+# ------------------
+# When /read <file> is called on a file with no VC history, the current
+# on-disk content is saved as a "Baseline (pre-edit)" commit.  That way
+# the FIRST AI write always diffs against the real original file, not an
+# empty string, so the auto-generated commit message is meaningful.
 # ==============================================================================
 
 _VC_CACHE: dict[str, dict] = {}   # filepath -> loaded VC index
@@ -271,7 +278,8 @@ def _vc_commit(
 ) -> str:
     """
     Create a new commit for filepath with new_content.
-    If message is None, auto-generates one via the LLM.
+    If message is None, auto-generates one via the LLM (using the diff
+    against the current HEAD snapshot as the basis).
     Returns the new commit ID.
     """
     idx: dict = _load_vc(filepath)
@@ -281,7 +289,7 @@ def _vc_commit(
     # Snapshot the new content
     snap: Path = _vc_snapshot(filepath, new_content)
 
-    # Auto-generate commit message
+    # Auto-generate commit message by diffing against the current HEAD
     parent_id: str | None = idx.get("head")
     if message is None:
         if parent_id and parent_id in idx["commits"]:
@@ -316,18 +324,49 @@ def _vc_commit(
     return cid
 
 
+def _vc_baseline(filepath: str) -> None:
+    """
+    If filepath has no VC history yet, snapshot its current on-disk content
+    as a 'Baseline (pre-edit)' commit so that the first AI write can diff
+    against the real original file rather than an empty string.
+
+    Safe to call multiple times - does nothing if a baseline already exists.
+    """
+    resolved: str = str(Path(filepath).resolve())
+    idx: dict = _load_vc(resolved)
+    if idx.get("head"):
+        return  # already has history
+    try:
+        content: str = Path(resolved).read_text(encoding="utf-8")
+    except Exception:
+        return  # file unreadable - skip
+    _vc_commit(resolved, content, "Baseline (pre-edit)")
+    console.print(f"[info]Baseline snapshot saved for [bold]{Path(resolved).name}[/bold][/info]")
+
+
 def write_file_with_vc(
     filepath: str,
     new_content: str,
     commit_message: str | None = None,
 ) -> None:
     """Write new_content to filepath and record a commit in the VC tree."""
+    # Normalise to an absolute path so baseline + write always address the
+    # same VC index regardless of cwd at call time.
+    resolved: str = str(Path(filepath).resolve())
+
+    # If the file exists on disk but has no VC history, save a baseline now
+    # so the diff is against the real pre-edit content.
+    if Path(resolved).exists():
+        idx_check: dict = _load_vc(resolved)
+        if not idx_check.get("head"):
+            _vc_baseline(resolved)
+
     path: Path = Path(filepath)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(new_content, encoding="utf-8")
 
-    cid: str  = _vc_commit(filepath, new_content, commit_message)
-    idx: dict = _load_vc(filepath)
+    cid: str  = _vc_commit(resolved, new_content, commit_message)
+    idx: dict = _load_vc(resolved)
     msg: str  = idx["commits"][cid]["message"]
     lines: int = len(new_content.splitlines())
 
@@ -357,6 +396,7 @@ def _resolve_commit(filepath: str, id_prefix: str) -> str | None:
 
 
 def do_undo(filepath: str) -> None:
+    filepath = str(Path(filepath).resolve())
     idx: dict = _load_vc(filepath)
     head_id: str | None = idx.get("head")
     if not head_id or head_id not in idx["commits"]:
@@ -384,6 +424,7 @@ def do_undo(filepath: str) -> None:
 
 
 def do_redo(filepath: str, target_id: str | None = None) -> None:
+    filepath = str(Path(filepath).resolve())
     idx: dict = _load_vc(filepath)
     head_id: str | None = idx.get("head")
     if not head_id or head_id not in idx["commits"]:
@@ -434,6 +475,7 @@ def do_redo(filepath: str, target_id: str | None = None) -> None:
 
 def do_checkout(filepath: str, id_prefix: str) -> None:
     """Check out any commit by ID (full or prefix)."""
+    filepath = str(Path(filepath).resolve())
     full_id: str | None = _resolve_commit(filepath, id_prefix)
     if not full_id:
         return
@@ -457,6 +499,7 @@ def do_checkout(filepath: str, id_prefix: str) -> None:
 
 def do_manual_commit(filepath: str, message: str) -> None:
     """Create an explicit commit of the current file state."""
+    filepath = str(Path(filepath).resolve())
     path: Path = Path(filepath)
     if not path.exists():
         console.print(f"[error]File not found: {filepath}[/error]")
@@ -474,6 +517,7 @@ def do_manual_commit(filepath: str, message: str) -> None:
 
 def show_log(filepath: str) -> None:
     """Display the commit tree for filepath."""
+    filepath = str(Path(filepath).resolve())
     idx: dict     = _load_vc(filepath)
     commits: dict = idx.get("commits", {})
     head_id: str | None = idx.get("head")
@@ -483,17 +527,16 @@ def show_log(filepath: str) -> None:
         console.print(f"[info]No commits recorded for {filepath}.[/info]")
         return
 
-    # Build tree lines via DFS from root
     lines: list[str] = []
 
     def _walk(cid: str, prefix: str, is_last: bool) -> None:
         c: dict = commits.get(cid, {})
         if not c:
             return
-        connector: str   = "\u2514\u2500\u2500 " if is_last else "\u251c\u2500\u2500 "
-        head_tag: str    = "  [bold yellow](HEAD)[/bold yellow]" if cid == head_id else ""
-        root_tag: str    = "  [dim](root)[/dim]" if cid == root_id and cid != head_id else ""
-        branch_tag: str  = ""
+        connector: str  = "\u2514\u2500\u2500 " if is_last else "\u251c\u2500\u2500 "
+        head_tag: str   = "  [bold yellow](HEAD)[/bold yellow]" if cid == head_id else ""
+        root_tag: str   = "  [dim](root)[/dim]" if cid == root_id and cid != head_id else ""
+        branch_tag: str = ""
         if len(commits.get(cid, {}).get("children", [])) > 1 or (
             c.get("parent_id") and
             len(commits.get(c["parent_id"], {}).get("children", [])) > 1
@@ -506,15 +549,14 @@ def show_log(filepath: str) -> None:
             f"{c.get('message', '?')}  "
             f"[dim]{c.get('timestamp', '')[:19]}[/dim]"
         )
-        child_prefix: str    = prefix + ("    " if is_last else "\u2502   ")
-        children: list[str]  = [ch for ch in c.get("children", []) if ch in commits]
+        child_prefix: str   = prefix + ("    " if is_last else "\u2502   ")
+        children: list[str] = [ch for ch in c.get("children", []) if ch in commits]
         for i, child_cid in enumerate(children):
             _walk(child_cid, child_prefix, i == len(children) - 1)
 
     if root_id and root_id in commits:
         _walk(root_id, "", True)
     else:
-        # fallback: show flat list sorted by timestamp
         for c in sorted(commits.values(), key=lambda x: x.get("timestamp", "")):
             head_tag = "  (HEAD)" if c["id"] == head_id else ""
             lines.append(f"[bold cyan]{c['id']}[/bold cyan]{head_tag}  {c['message']}  [dim]{c['timestamp'][:19]}[/dim]")
@@ -786,7 +828,7 @@ def _enable_windows_vt() -> None:
 def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
     """
     Character-by-character prompt.  Hint line appears ONE ROW ABOVE the
-    prompt using ANSI cursor-up (\033[1A).  Works on Windows PowerShell /
+    prompt using ANSI cursor-up.  Works on Windows PowerShell /
     Windows Terminal (VT enabled) and Unix.
 
     Layout:
@@ -1251,6 +1293,7 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
         if not arg:
             console.print("[error]Usage: /read <filepath> | /read -a[/error]")
         elif arg.strip() == "-a":
+            # Read all files recursively and snapshot each as a baseline
             try:
                 all_files: list[Path] = [
                     f for f in Path(cwd).rglob("*")
@@ -1262,6 +1305,7 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
                 snippets: list[str] = []
                 total_chars: int    = 0
                 skipped: list[str]  = []
+                baselined: int      = 0
                 for sf in sorted(all_files):
                     rel: str = os.path.relpath(str(sf), cwd)
                     try:
@@ -1270,6 +1314,11 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
                         skipped.append(rel); continue
                     if total_chars + len(fc) > 400_000:
                         skipped.append(rel); continue
+                    # Baseline snapshot on first read
+                    resolved_f: str = str(sf.resolve())
+                    if not _load_vc(resolved_f).get("head"):
+                        _vc_commit(resolved_f, fc, "Baseline (pre-edit)")
+                        baselined += 1
                     snippets.append(f"### {rel}\n```\n{fc}\n```")
                     total_chars += len(fc)
                 if skipped:
@@ -1278,12 +1327,22 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
                     state.setdefault("pending_context", []).append(
                         f"Here are all {len(snippets)} file(s) from `{cwd}`:\n\n" + "\n\n".join(snippets)
                     )
-                    console.print(f"[info]Loaded {len(snippets)} file(s) into context.[/info]")
+                    console.print(
+                        f"[info]Loaded {len(snippets)} file(s) into context"
+                        + (f", saved {baselined} baseline snapshot(s)." if baselined else ".")
+                        + "[/info]"
+                    )
                 else:
                     console.print("[info]No readable files found.[/info]")
         else:
+            # Read single file and snapshot as baseline if not yet tracked
             resolved: str = resolve_path(arg, cwd)
             content: str  = read_file(resolved)
+            if Path(resolved).exists():
+                resolved_abs: str = str(Path(resolved).resolve())
+                if not _load_vc(resolved_abs).get("head"):
+                    _vc_commit(resolved_abs, content, "Baseline (pre-edit)")
+                    console.print(f"[info]Baseline snapshot saved for [bold]{Path(resolved).name}[/bold][/info]")
             state.setdefault("pending_context", []).append(
                 f"Here is the content of `{resolved}`:\n\n```\n{content}\n```"
             )
@@ -1298,7 +1357,6 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
             console.print(Panel(output, title=f"$ {arg}", border_style=SAKURA_MUTED))
 
     elif name == "/undo":
-        # Usage: /undo [filepath]
         if not arg:
             tracked: list[str] = _all_tracked_files()
             candidates: list[str] = [
@@ -1315,7 +1373,6 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
             do_undo(resolve_path(arg.split()[0], cwd))
 
     elif name == "/redo":
-        # Usage: /redo [filepath] [commit_id]
         tokens: list[str] = arg.split(maxsplit=1) if arg else []
         if not tokens:
             tracked = _all_tracked_files()
@@ -1335,7 +1392,6 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
             do_redo(resolve_path(tokens[0], cwd), target_id=tokens[1])
 
     elif name == "/checkout":
-        # Usage: /checkout <commit_id> [filepath]
         if not arg:
             console.print("[error]Usage: /checkout <commit_id> [filepath][/error]")
         else:
@@ -1345,7 +1401,6 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
             if fp_arg:
                 do_checkout(resolve_path(fp_arg, cwd), commit_id_arg)
             else:
-                # Try to find which file has this commit
                 tracked = _all_tracked_files()
                 found: list[str] = []
                 for fp in tracked:
@@ -1381,7 +1436,6 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
         handle_stackview(arg, cwd, messages)
 
     elif name == "/commit":
-        # Usage: /commit [filepath] [message]
         if not arg:
             console.print("[error]Usage: /commit <filepath> [message][/error]")
         else:
@@ -1409,8 +1463,8 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
         console.print(Panel(textwrap.dedent("""\
             Available commands:
               /cd [dir]              change working directory
-              /read <file>           load file into context
-              /read -a               load ALL files recursively (up to 400 KB)
+              /read <file>           load file into context  (saves baseline snapshot)
+              /read -a               load ALL files recursively (saves baseline snapshots)
               /run <cmd>             run a shell command
               /clear                 clear conversation history
               /check <target>        AI code review (ALL | file | file:func)
@@ -1419,13 +1473,17 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
               /help                  show this help
               /quit                  exit
 
-            Version control (git-like):
+            Version control (git-like, tree-based):
               /undo [file]           move HEAD to parent commit
               /redo [file] [id]      move HEAD to child (menu if branched)
               /checkout <id> [file]  check out any commit by ID
               /commit <file> [msg]   manually commit current file state
               /log [file]            show commit tree
               /files                 list all tracked files
+
+            Workflow:
+              /read file.py          -> baseline snapshot created
+              (ask AI to edit)       -> AI writes -> diff vs baseline -> AI commit msg
         """), title="Help", border_style=SAKURA_DEEP))
 
     else:
