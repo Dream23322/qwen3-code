@@ -9,6 +9,7 @@ import contextlib
 import difflib
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -95,9 +96,7 @@ def _assistant_name() -> str:  return CFG["assistant_name"]
 
 VC_DIR: Path      = Path.home() / ".local" / "share" / "qwen3-code" / "vc"
 SESSION_DIR: Path = Path.home() / ".local" / "share" / "qwen3-code" / "sessions"
-STREAM_MAX_LINES: int = 10
-
-# If the new file content is this fraction smaller than the original, warn the user.
+STREAM_MAX_LINES: int   = 10
 SIZE_REDUCTION_THRESHOLD: float = 0.20
 
 _PARTIAL_REPROMPT: str = (
@@ -156,19 +155,23 @@ custom_theme: Theme = Theme({
 console: Console = Console(theme=custom_theme)
 
 # ---------------------------------------------------------------------------
-# Animated spinner (used while waiting for blocking calls)
+# Physical-row helper
+# ---------------------------------------------------------------------------
+
+def _phys_rows(text: str, term_w: int) -> int:
+    """Number of terminal rows a plain-text string occupies given terminal width."""
+    if term_w <= 0 or not text:
+        return 1
+    return max(1, math.ceil(len(text) / term_w))
+
+
+# ---------------------------------------------------------------------------
+# Animated spinner
 # ---------------------------------------------------------------------------
 
 @contextlib.contextmanager
 def _spinning_dots(message: str) -> Generator[None, None, None]:
-    """Show an animated '...' spinner on a single stdout line.
-
-    The spinner runs in a daemon thread so the main thread can do blocking
-    work.  On exit the line is cleared and the cursor left at column 0 so
-    the caller can print the result cleanly.
-    """
     stop_event: threading.Event = threading.Event()
-
     frames: list[str] = ["   ", ".  ", ".. ", "..."]
 
     def _spin() -> None:
@@ -178,7 +181,6 @@ def _spinning_dots(message: str) -> Generator[None, None, None]:
             sys.stdout.flush()
             i += 1
             time.sleep(0.25)
-        # Clear the line.
         sys.stdout.write("\r" + " " * (len(message) + 8) + "\r")
         sys.stdout.flush()
 
@@ -414,7 +416,6 @@ def _make_commit_id(filepath: str, content: str, ts: str) -> str:
 
 
 def _generate_commit_message(filepath: str, old_content: str, new_content: str) -> str:
-    """Ask the model for a commit message while showing an animated spinner."""
     fname: str           = Path(filepath).name
     old_lines: list[str] = old_content.splitlines()
     new_lines: list[str] = new_content.splitlines()
@@ -528,10 +529,6 @@ def _confirm_size_reduction(
     new_content: str,
     reduction: float,
 ) -> bool:
-    """Show a diff and ask the user whether to keep the smaller new content.
-
-    Returns True if the user confirms the write, False to cancel it.
-    """
     old_lines: list[str] = old_content.splitlines()
     new_lines: list[str] = new_content.splitlines()
     diff: list[str] = list(difflib.unified_diff(
@@ -559,8 +556,6 @@ def _confirm_size_reduction(
             title="Diff  (current \u2192 proposed)",
             border_style=SAKURA_MUTED,
         ))
-    else:
-        console.print("[info](no textual diff available)[/info]")
 
     try:
         answer: str = input("Write anyway? [y/N] ").strip().lower()
@@ -581,13 +576,11 @@ def write_file_with_vc(
 ) -> None:
     resolved: str = str(Path(filepath).resolve())
 
-    # ---- 1. Baseline if the file is not yet tracked -----------------------
     if Path(resolved).exists():
         idx_check: dict = _load_vc(resolved)
         if not idx_check.get("head"):
             _vc_baseline(resolved)
 
-    # ---- 2. Size-reduction guard ------------------------------------------
     if Path(resolved).exists():
         try:
             existing: str = Path(resolved).read_text(encoding="utf-8")
@@ -598,9 +591,8 @@ def write_file_with_vc(
                         console.print("[info]Write cancelled by user.[/info]")
                         return
         except Exception:
-            pass  # unreadable / binary file — proceed without check
+            pass
 
-    # ---- 3. Write & commit ------------------------------------------------
     path: Path = Path(filepath)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(new_content, encoding="utf-8")
@@ -1795,22 +1787,47 @@ def _raw_stream(
     messages: list[dict],
     cancel_event: threading.Event | None = None,
 ) -> tuple[str, int]:
+    """Stream tokens with a rolling STREAM_MAX_LINES-line window.
+
+    Tracks *physical* terminal rows (accounting for line-wrapping) so that
+    the cursor-up calculations are correct even when a single logical line
+    is wider than the terminal.
+
+    Returns (full_text, total_physical_rows_on_screen).
+    """
     full: str          = ""
-    window: list[str]  = []
-    partial: str       = ""
-    rendered_rows: int = 0
+    window: list[str]  = []   # logical lines in the visible window
+    partial: str       = ""   # current incomplete line
+    # physical rows currently on screen:
+    #   rendered_rows = sum(_phys(l) for l in window) + partial_phys
+    rendered_rows: int  = 0
+    partial_phys: int   = 0   # physical rows used by the current partial line
+
+    def _tw() -> int:
+        """Terminal width, never 0."""
+        return max(1, console.width or 80)
+
+    def _phys(text: str) -> int:
+        return _phys_rows(text, _tw())
 
     def _redraw() -> None:
-        nonlocal rendered_rows
-        lines_above = rendered_rows - 1
-        if lines_above > 0:
-            sys.stdout.write(f"\033[{lines_above}A")
+        """Redraw the entire window + partial, using physical-row tracking."""
+        nonlocal rendered_rows, partial_phys
+        # Move cursor back to the very top of our window area.
+        # Cursor is at the END of the partial line which is at physical row
+        # (rendered_rows - 1) from the top.  So go up (rendered_rows - 1) rows.
+        if rendered_rows > 1:
+            sys.stdout.write(f"\033[{rendered_rows - 1}A")
         sys.stdout.write("\r")
+        # Erase everything from here to the end of the screen, then redraw.
+        sys.stdout.write("\033[J")
         for line in window:
-            sys.stdout.write("\033[2K" + line + "\n")
-        sys.stdout.write("\033[2K" + partial)
+            sys.stdout.write(line + "\n")
+        sys.stdout.write(partial)
         sys.stdout.flush()
-        rendered_rows = len(window) + 1
+        # Recalculate physical rows.
+        partial_phys  = _phys(partial)
+        rendered_rows = sum(_phys(l) for l in window) + partial_phys
 
     try:
         for chunk in ollama.chat(model=_model(), messages=messages, stream=True):
@@ -1820,6 +1837,7 @@ def _raw_stream(
             full += token
 
             if "\n" in token:
+                # ---- newline(s) in this token --------------------------------
                 parts: list[str] = token.split("\n")
                 partial += parts[0]
                 window.append(partial)
@@ -1832,13 +1850,28 @@ def _raw_stream(
                 partial = parts[-1]
                 _redraw()
             else:
-                partial += token
+                # ---- no newline: extend partial line in-place ----------------
+                new_partial: str  = partial + token
+                new_phys: int     = _phys(new_partial)
+
                 if rendered_rows == 0:
-                    sys.stdout.write(partial)
-                    rendered_rows = 1
+                    # Very first token — just write it.
+                    sys.stdout.write(new_partial)
+                    sys.stdout.flush()
+                    partial_phys  = new_phys
+                    rendered_rows = new_phys
                 else:
-                    sys.stdout.write("\r\033[2K" + partial)
-                sys.stdout.flush()
+                    # Move up to the start of the current partial (it may span
+                    # multiple physical rows if it previously wrapped).
+                    if partial_phys > 1:
+                        sys.stdout.write(f"\033[{partial_phys - 1}A")
+                    # Erase from here to end-of-screen and rewrite the partial.
+                    sys.stdout.write("\r\033[J" + new_partial)
+                    sys.stdout.flush()
+                    rendered_rows = rendered_rows - partial_phys + new_phys
+                    partial_phys  = new_phys
+
+                partial = new_partial
 
     except Exception as exc:
         if not (cancel_event and cancel_event.is_set()):
