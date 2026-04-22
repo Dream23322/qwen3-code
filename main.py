@@ -47,9 +47,10 @@ except ImportError:
 
 # -- Constants -----------------------------------------------------------------
 
-MODEL: str        = "huihui_ai/qwen3-coder-abliterated:30b"
-VC_DIR: Path      = Path.home() / ".local" / "share" / "qwen3-code" / "vc"
-SESSION_DIR: Path = Path.home() / ".local" / "share" / "qwen3-code" / "sessions"
+MODEL: str              = "huihui_ai/qwen3-coder-abliterated:30b"
+VC_DIR: Path            = Path.home() / ".local" / "share" / "qwen3-code" / "vc"
+SESSION_DIR: Path       = Path.home() / ".local" / "share" / "qwen3-code" / "sessions"
+STREAM_MAX_LINES: int   = 10   # rolling window height during streaming
 
 _PARTIAL_REPROMPT: str = (
     "Your last response contained a partial file (it included truncation markers like "
@@ -109,17 +110,7 @@ console: Console = Console(theme=custom_theme)
 # -- Help table builder --------------------------------------------------------
 
 def _help_table() -> Table:
-    """
-    Build the /help two-column table.
-    Left column: command (left-aligned, fixed minimum width).
-    Right column: description (right-aligned, expands to fill panel).
-    """
-    t = Table(
-        show_header=False,
-        box=None,
-        padding=(0, 1),
-        expand=True,
-    )
+    t = Table(show_header=False, box=None, padding=(0, 1), expand=True)
     t.add_column("cmd",  no_wrap=True, min_width=26)
     t.add_column("desc", justify="right")
 
@@ -127,7 +118,6 @@ def _help_table() -> Table:
     E = "[/dim]"
 
     rows: list[tuple[str, str]] = [
-        # General
         ("[bold]General[/bold]", ""),
         ("/cd [dir]",             "change working directory"),
         ("/read <file>",          f"load file into context  {D}(saves baseline snapshot){E}"),
@@ -139,9 +129,7 @@ def _help_table() -> Table:
         ("/history",              "show message history"),
         ("/help",                 "show this help"),
         ("/quit",                 "exit"),
-        # Spacer
         ("", ""),
-        # VC
         ("[bold]Version control[/bold]", f"{D}git-like, tree-based{E}"),
         ("/undo [file]",          "move HEAD to parent commit"),
         ("/redo [file] [id]",     f"move HEAD to child  {D}(menu if branched){E}"),
@@ -149,12 +137,10 @@ def _help_table() -> Table:
         ("/commit <file> [msg]",  "manually commit current file state"),
         ("/log [file]",           "show commit tree"),
         ("/files",                "list all tracked files"),
-        # Spacer
         ("", ""),
-        # Workflow
         ("[bold]Workflow[/bold]", ""),
         ("/read file.py",         f"{D}baseline snapshot created{E}"),
-        ("ask AI to edit",        f"{D}AI writes → diff vs baseline → AI commit msg{E}"),
+        ("ask AI to edit",        f"{D}AI writes \u2192 diff vs baseline \u2192 AI commit msg{E}"),
     ]
 
     for cmd_text, desc_text in rows:
@@ -1525,63 +1511,150 @@ def _status_line(left: str, right: str) -> Text:
     return line
 
 
-def _raw_stream(messages: list[dict], cancel_event: threading.Event | None = None) -> tuple[str, int]:
-    full: str       = ""
-    term_width: int = console.width or 80
-    phys_lines: int = 1
-    col: int        = 0
+def _raw_stream(
+    messages: list[dict],
+    cancel_event: threading.Event | None = None,
+) -> tuple[str, int]:
+    """
+    Stream tokens from Ollama with a rolling STREAM_MAX_LINES-line window.
+
+    The terminal shows at most STREAM_MAX_LINES complete lines at once;
+    when a new line would exceed the limit the oldest is dropped and the
+    window redraws in-place.  The current (incomplete) partial line is
+    always shown below the window.
+
+    Returns (full_text, rendered_rows) where rendered_rows is the number
+    of terminal rows currently occupied by the stream output.  The caller
+    is responsible for erasing those rows (plus any rows above like the
+    status line) before rendering the final markdown.
+    """
+    full: str          = ""
+    window: list[str]  = []   # complete lines in the visible window
+    partial: str       = ""   # current incomplete line being built
+    rendered_rows: int = 0    # total rows on screen (window lines + partial line)
+
+    def _redraw() -> None:
+        """Redraw the entire window + partial in place."""
+        nonlocal rendered_rows
+        # Move cursor back to the top of our window area.
+        # rendered_rows - 1 = number of lines ABOVE the partial (i.e. window lines).
+        lines_above = rendered_rows - 1
+        if lines_above > 0:
+            sys.stdout.write(f"\033[{lines_above}A")
+        sys.stdout.write("\r")
+        # Write each window line, clearing to end-of-line.
+        for line in window:
+            sys.stdout.write("\033[2K" + line + "\n")
+        # Write the partial line (no trailing newline).
+        sys.stdout.write("\033[2K" + partial)
+        sys.stdout.flush()
+        rendered_rows = len(window) + 1   # window lines + partial line
+
     try:
         for chunk in ollama.chat(model=MODEL, messages=messages, stream=True):
             if cancel_event and cancel_event.is_set():
                 break
             token: str = chunk["message"]["content"]
             full += token
-            for ch in token:
-                if ch == "\n":  phys_lines += 1; col = 0
+
+            if "\n" in token:
+                # Split on newlines; each split boundary means a line was completed.
+                parts: list[str] = token.split("\n")
+
+                # First segment completes the current partial.
+                partial += parts[0]
+                window.append(partial)
+                if len(window) > STREAM_MAX_LINES:
+                    window = window[-STREAM_MAX_LINES:]
+
+                # Middle segments are complete lines with no further content yet.
+                for mid in parts[1:-1]:
+                    window.append(mid)
+                    if len(window) > STREAM_MAX_LINES:
+                        window = window[-STREAM_MAX_LINES:]
+
+                # Last segment starts the new partial line.
+                partial = parts[-1]
+                _redraw()
+
+            else:
+                # No newline: extend partial and overwrite only the bottom line.
+                partial += token
+                if rendered_rows == 0:
+                    # First token ever — just write it; cursor stays on same line.
+                    sys.stdout.write(partial)
+                    rendered_rows = 1
                 else:
-                    col += 1
-                    if col >= term_width: phys_lines += 1; col = 0
-            sys.stdout.write(token)
-            sys.stdout.flush()
-        sys.stdout.write("\n")
-        sys.stdout.flush()
+                    # Cursor is already on the partial line; overwrite it.
+                    sys.stdout.write("\r\033[2K" + partial)
+                sys.stdout.flush()
+
     except Exception as exc:
         if not (cancel_event and cancel_event.is_set()):
             console.print(f"[error]Ollama error: {exc}[/error]")
             console.print(f"[info]  ollama pull {MODEL}[/info]")
-    return full, phys_lines
+
+    return full, rendered_rows
 
 
 def stream_response(messages: list[dict], cwd: str = "") -> str:
     cancel_event: threading.Event = threading.Event()
+
+    # Print a blank line then the status bar.
+    # These 2 lines are counted when clearing after streaming.
     console.print()
     console.print(_status_line("thinking...", "ctrl+d to cancel"))
-    watcher: threading.Thread = threading.Thread(target=_watch_for_cancel, args=(cancel_event,), daemon=True)
+
+    watcher: threading.Thread = threading.Thread(
+        target=_watch_for_cancel, args=(cancel_event,), daemon=True
+    )
     watcher.start()
-    full_reply, phys_lines = _raw_stream(messages, cancel_event)
+    full_reply, window_rows = _raw_stream(messages, cancel_event)
     cancel_event.set()
     watcher.join(timeout=0.5)
 
+    # ------------------------------------------------------------------ clear
+    # Erase the stream window AND the 2 header lines (blank + status bar).
+    #
+    # Cursor is currently at the end of the partial line, which is:
+    #   window_rows - 1  lines below the start of the window area
+    #   + 2              lines below the blank/status lines
+    # So total cursor-up needed to reach the blank line:
+    #   (window_rows - 1) + 2  =  window_rows + 1  (for window_rows >= 1)
+    #   or simply 2            (for window_rows == 0, nothing was printed)
+    clear_rows: int = max(2, window_rows + 1)
+    sys.stdout.write(f"\033[{clear_rows}A\r\033[J")
+    sys.stdout.flush()
+    # -------------------------------------------------------------------/ clear
+
     if not full_reply:
-        if cancel_event.is_set(): console.print("[info]Cancelled.[/info]")
+        if cancel_event.is_set():
+            console.print("[info]Cancelled.[/info]")
         return full_reply
 
     if _reply_has_partial_write(full_reply):
-        console.print(Panel("[info]Partial file detected. Reprompting...[/info]", title="Partial write", border_style=SAKURA_DARK))
+        console.print(Panel(
+            "[info]Partial file detected. Reprompting...[/info]",
+            title="Partial write", border_style=SAKURA_DARK,
+        ))
         messages.append({"role": "assistant", "content": full_reply})
         messages.append({"role": "user",      "content": _PARTIAL_REPROMPT})
         rc: threading.Event = threading.Event()
         console.print()
         console.print(_status_line("retrying...", "ctrl+d to cancel"))
-        rw: threading.Thread = threading.Thread(target=_watch_for_cancel, args=(rc,), daemon=True)
+        rw: threading.Thread = threading.Thread(
+            target=_watch_for_cancel, args=(rc,), daemon=True
+        )
         rw.start()
-        rr, rl = _raw_stream(messages, rc)
+        rr, rw_rows = _raw_stream(messages, rc)
         rc.set(); rw.join(timeout=0.5)
+        clear_rows_r = max(2, rw_rows + 1)
+        sys.stdout.write(f"\033[{clear_rows_r}A\r\033[J")
+        sys.stdout.flush()
         messages.pop(); messages.pop()
-        if rr: full_reply = rr; phys_lines = rl
+        if rr:
+            full_reply = rr
 
-    sys.stdout.write(f"\033[{phys_lines}A\033[J")
-    sys.stdout.flush()
     render_response(full_reply)
     apply_file_writes(full_reply)
     apply_command_runs(full_reply, cwd, messages)
@@ -1601,6 +1674,9 @@ def main() -> None:
         target: Path = Path(raw_dir).expanduser().resolve()
         if not target.is_dir(): print(f"[error] Not a directory: {raw_dir}"); sys.exit(1)
         os.chdir(target)
+
+    # Enable VT processing early so ANSI codes work in the stream window on Windows.
+    _enable_windows_vt()
 
     VC_DIR.mkdir(parents=True, exist_ok=True)
     SESSION_DIR.mkdir(parents=True, exist_ok=True)
