@@ -30,6 +30,7 @@ try:
     from rich.panel import Panel
     from rich.prompt import Prompt
     from rich.syntax import Syntax
+    from rich.table import Table
     from rich.theme import Theme
     from rich.text import Text
 except ImportError:
@@ -105,6 +106,63 @@ custom_theme: Theme = Theme({
 
 console: Console = Console(theme=custom_theme)
 
+# -- Help table builder --------------------------------------------------------
+
+def _help_table() -> Table:
+    """
+    Build the /help two-column table.
+    Left column: command (left-aligned, fixed minimum width).
+    Right column: description (right-aligned, expands to fill panel).
+    """
+    t = Table(
+        show_header=False,
+        box=None,
+        padding=(0, 1),
+        expand=True,
+    )
+    t.add_column("cmd",  no_wrap=True, min_width=26)
+    t.add_column("desc", justify="right")
+
+    D = "[dim]"
+    E = "[/dim]"
+
+    rows: list[tuple[str, str]] = [
+        # General
+        ("[bold]General[/bold]", ""),
+        ("/cd [dir]",             "change working directory"),
+        ("/read <file>",          f"load file into context  {D}(saves baseline snapshot){E}"),
+        ("/read -a",              f"load ALL files recursively  {D}(saves baseline snapshots){E}"),
+        ("/run <cmd>",            "run a shell command"),
+        ("/clear",                "clear conversation history"),
+        ("/check <target>",       f"AI code review  {D}ALL | file | file:func{E}"),
+        ("/stackview <type>",     f"inspect state  {D}fh / fhf / sessions / env{E}"),
+        ("/history",              "show message history"),
+        ("/help",                 "show this help"),
+        ("/quit",                 "exit"),
+        # Spacer
+        ("", ""),
+        # VC
+        ("[bold]Version control[/bold]", f"{D}git-like, tree-based{E}"),
+        ("/undo [file]",          "move HEAD to parent commit"),
+        ("/redo [file] [id]",     f"move HEAD to child  {D}(menu if branched){E}"),
+        ("/checkout <id> [file]", "check out any commit by ID"),
+        ("/commit <file> [msg]",  "manually commit current file state"),
+        ("/log [file]",           "show commit tree"),
+        ("/files",                "list all tracked files"),
+        # Spacer
+        ("", ""),
+        # Workflow
+        ("[bold]Workflow[/bold]", ""),
+        ("/read file.py",         f"{D}baseline snapshot created{E}"),
+        ("ask AI to edit",        f"{D}AI writes → diff vs baseline → AI commit msg{E}"),
+    ]
+
+    for cmd_text, desc_text in rows:
+        t.add_row(f"  {cmd_text}", desc_text)
+
+    return t
+
+
 # -- Path helpers --------------------------------------------------------------
 
 def _short_cwd(cwd: str) -> str:
@@ -157,34 +215,11 @@ def load_session(cwd: str) -> list[dict]:
 # ==============================================================================
 # Git-like version control
 # ==============================================================================
-#
-# Each file tracked by qwen3-code gets a commit tree stored in VC_DIR.
-# A commit node looks like:
-#   {
-#     "id":        "abc1234",          # 7-char hex
-#     "message":   "Fix /check cmd",   # auto-generated or user-supplied
-#     "timestamp": "2026-04-21T...",
-#     "parent_id": "def5678" | null,   # null for root commit
-#     "snapshot":  "/path/file.bak",   # full file content at this commit
-#     "children":  ["ghi9012", ...],   # child commit IDs
-#   }
-#
-# The index for a file stores all commits + current HEAD pointer.
-# Branching happens naturally: /undo then a new write creates a branch.
-#
-# Baseline snapshots
-# ------------------
-# When /read <file> is called on a file with no VC history, the current
-# on-disk content is saved as a "Baseline (pre-edit)" commit.  That way
-# the FIRST AI write always diffs against the real original file, not an
-# empty string, so the auto-generated commit message is meaningful.
-# ==============================================================================
 
 _VC_CACHE: dict[str, dict] = {}   # filepath -> loaded VC index
 
 
 def _vc_slot(filepath: str) -> Path:
-    """Return the directory holding VC data for filepath."""
     safe: str = re.sub(r"[^\w.\-]", "_", str(Path(filepath).resolve()))[-48:]
     slot: Path = VC_DIR / safe
     slot.mkdir(parents=True, exist_ok=True)
@@ -196,7 +231,6 @@ def _vc_index_path(filepath: str) -> Path:
 
 
 def _load_vc(filepath: str) -> dict:
-    """Load (or create) the VC index for filepath."""
     if filepath in _VC_CACHE:
         return _VC_CACHE[filepath]
     p: Path = _vc_index_path(filepath)
@@ -218,7 +252,6 @@ def _save_vc(filepath: str) -> None:
 
 
 def _vc_snapshot(filepath: str, content: str) -> Path:
-    """Write content to a .bak snapshot file and return its path."""
     slot: Path = _vc_slot(filepath)
     ts: str    = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     bak: Path  = slot / f"{ts}.bak"
@@ -227,16 +260,11 @@ def _vc_snapshot(filepath: str, content: str) -> Path:
 
 
 def _make_commit_id(filepath: str, content: str, ts: str) -> str:
-    """Generate a short unique commit ID (7 hex chars)."""
     raw: str = f"{filepath}:{ts}:{len(content)}:{content[:128]}"
     return hashlib.sha1(raw.encode()).hexdigest()[:7]
 
 
 def _generate_commit_message(filepath: str, old_content: str, new_content: str) -> str:
-    """
-    Ask the LLM to write a one-line git-style commit message for the change.
-    Falls back to a heuristic summary if Ollama is unavailable.
-    """
     fname: str           = Path(filepath).name
     old_lines: list[str] = old_content.splitlines()
     new_lines: list[str] = new_content.splitlines()
@@ -276,20 +304,12 @@ def _vc_commit(
     new_content: str,
     message: str | None = None,
 ) -> str:
-    """
-    Create a new commit for filepath with new_content.
-    If message is None, auto-generates one via the LLM (using the diff
-    against the current HEAD snapshot as the basis).
-    Returns the new commit ID.
-    """
     idx: dict = _load_vc(filepath)
     ts: str   = datetime.now().isoformat()
     cid: str  = _make_commit_id(filepath, new_content, ts)
 
-    # Snapshot the new content
     snap: Path = _vc_snapshot(filepath, new_content)
 
-    # Auto-generate commit message by diffing against the current HEAD
     parent_id: str | None = idx.get("head")
     if message is None:
         if parent_id and parent_id in idx["commits"]:
@@ -310,7 +330,6 @@ def _vc_commit(
         "children":  [],
     }
 
-    # Register this commit as a child of the current HEAD
     if parent_id and parent_id in idx["commits"]:
         if cid not in idx["commits"][parent_id]["children"]:
             idx["commits"][parent_id]["children"].append(cid)
@@ -325,21 +344,14 @@ def _vc_commit(
 
 
 def _vc_baseline(filepath: str) -> None:
-    """
-    If filepath has no VC history yet, snapshot its current on-disk content
-    as a 'Baseline (pre-edit)' commit so that the first AI write can diff
-    against the real original file rather than an empty string.
-
-    Safe to call multiple times - does nothing if a baseline already exists.
-    """
     resolved: str = str(Path(filepath).resolve())
     idx: dict = _load_vc(resolved)
     if idx.get("head"):
-        return  # already has history
+        return
     try:
         content: str = Path(resolved).read_text(encoding="utf-8")
     except Exception:
-        return  # file unreadable - skip
+        return
     _vc_commit(resolved, content, "Baseline (pre-edit)")
     console.print(f"[info]Baseline snapshot saved for [bold]{Path(resolved).name}[/bold][/info]")
 
@@ -349,13 +361,8 @@ def write_file_with_vc(
     new_content: str,
     commit_message: str | None = None,
 ) -> None:
-    """Write new_content to filepath and record a commit in the VC tree."""
-    # Normalise to an absolute path so baseline + write always address the
-    # same VC index regardless of cwd at call time.
     resolved: str = str(Path(filepath).resolve())
 
-    # If the file exists on disk but has no VC history, save a baseline now
-    # so the diff is against the real pre-edit content.
     if Path(resolved).exists():
         idx_check: dict = _load_vc(resolved)
         if not idx_check.get("head"):
@@ -380,7 +387,6 @@ def write_file_with_vc(
 # -- VC navigation commands ----------------------------------------------------
 
 def _resolve_commit(filepath: str, id_prefix: str) -> str | None:
-    """Resolve a full or partial commit ID to a full ID. Returns None if not found."""
     idx: dict = _load_vc(filepath)
     commits: dict = idx.get("commits", {})
     if id_prefix in commits:
@@ -474,7 +480,6 @@ def do_redo(filepath: str, target_id: str | None = None) -> None:
 
 
 def do_checkout(filepath: str, id_prefix: str) -> None:
-    """Check out any commit by ID (full or prefix)."""
     filepath = str(Path(filepath).resolve())
     full_id: str | None = _resolve_commit(filepath, id_prefix)
     if not full_id:
@@ -498,7 +503,6 @@ def do_checkout(filepath: str, id_prefix: str) -> None:
 
 
 def do_manual_commit(filepath: str, message: str) -> None:
-    """Create an explicit commit of the current file state."""
     filepath = str(Path(filepath).resolve())
     path: Path = Path(filepath)
     if not path.exists():
@@ -516,7 +520,6 @@ def do_manual_commit(filepath: str, message: str) -> None:
 
 
 def show_log(filepath: str) -> None:
-    """Display the commit tree for filepath."""
     filepath = str(Path(filepath).resolve())
     idx: dict     = _load_vc(filepath)
     commits: dict = idx.get("commits", {})
@@ -569,7 +572,6 @@ def show_log(filepath: str) -> None:
 
 
 def _all_tracked_files() -> list[str]:
-    """Return all filepaths that have a VC index in VC_DIR."""
     result: list[str] = []
     if not VC_DIR.exists():
         return result
@@ -826,15 +828,6 @@ def _enable_windows_vt() -> None:
 # -- Inline prompt with fuzzy hint above ---------------------------------------
 
 def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
-    """
-    Character-by-character prompt.  Hint line appears ONE ROW ABOVE the
-    prompt using ANSI cursor-up.  Works on Windows PowerShell /
-    Windows Terminal (VT enabled) and Unix.
-
-    Layout:
-        [hint]   /cd ../Soda-Clicker  /cd ../aurora-user  ...
-        [prompt] you (dir): /cd ../S_
-    """
     _enable_windows_vt()
 
     BOLD: str  = "\033[1m"
@@ -847,8 +840,8 @@ def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
     )
     RESET: str = "\033[0m"
 
-    UP_CLEAR   = "\033[1A\r\033[2K"   # up 1, col 0, erase line
-    LINE_CLEAR = "\r\033[2K"          # col 0, erase current line
+    UP_CLEAR   = "\033[1A\r\033[2K"
+    LINE_CLEAR = "\r\033[2K"
 
     buf: list[str]       = []
     hist_idx: int        = len(history)
@@ -881,7 +874,6 @@ def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
         best: str = matches[0]
         return best + " " if best in _SLASH_COMMANDS else best
 
-    # Initial print: blank hint line above, prompt below.
     sys.stdout.write("\n" + prompt_str)
     sys.stdout.flush()
 
@@ -896,7 +888,6 @@ def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
         sys.stdout.write(UP_CLEAR + "\n" + LINE_CLEAR)
         sys.stdout.flush()
 
-    # Input loop
     try:
         if sys.platform == "win32":
             import msvcrt
@@ -1293,7 +1284,6 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
         if not arg:
             console.print("[error]Usage: /read <filepath> | /read -a[/error]")
         elif arg.strip() == "-a":
-            # Read all files recursively and snapshot each as a baseline
             try:
                 all_files: list[Path] = [
                     f for f in Path(cwd).rglob("*")
@@ -1314,7 +1304,6 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
                         skipped.append(rel); continue
                     if total_chars + len(fc) > 400_000:
                         skipped.append(rel); continue
-                    # Baseline snapshot on first read
                     resolved_f: str = str(sf.resolve())
                     if not _load_vc(resolved_f).get("head"):
                         _vc_commit(resolved_f, fc, "Baseline (pre-edit)")
@@ -1335,7 +1324,6 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
                 else:
                     console.print("[info]No readable files found.[/info]")
         else:
-            # Read single file and snapshot as baseline if not yet tracked
             resolved: str = resolve_path(arg, cwd)
             content: str  = read_file(resolved)
             if Path(resolved).exists():
@@ -1460,31 +1448,7 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
             console.print(f"[info][{i}] {m['role']}: {m['content'][:120].replace(chr(10), ' ')}[/info]")
 
     elif name == "/help":
-        console.print(Panel(textwrap.dedent("""\
-            Available commands:
-              /cd [dir]              change working directory
-              /read <file>           load file into context  (saves baseline snapshot)
-              /read -a               load ALL files recursively (saves baseline snapshots)
-              /run <cmd>             run a shell command
-              /clear                 clear conversation history
-              /check <target>        AI code review (ALL | file | file:func)
-              /stackview <type>      view fh / fhf / sessions / env
-              /history               show message history
-              /help                  show this help
-              /quit                  exit
-
-            Version control (git-like, tree-based):
-              /undo [file]           move HEAD to parent commit
-              /redo [file] [id]      move HEAD to child (menu if branched)
-              /checkout <id> [file]  check out any commit by ID
-              /commit <file> [msg]   manually commit current file state
-              /log [file]            show commit tree
-              /files                 list all tracked files
-
-            Workflow:
-              /read file.py          -> baseline snapshot created
-              (ask AI to edit)       -> AI writes -> diff vs baseline -> AI commit msg
-        """), title="Help", border_style=SAKURA_DEEP))
+        console.print(Panel(_help_table(), title="Help", border_style=SAKURA_DEEP))
 
     else:
         console.print(f"[error]Unknown command: {name}. Type /help for a list.[/error]")
