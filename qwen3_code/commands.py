@@ -9,10 +9,10 @@ from rich.panel import Panel
 from rich.table import Table
 
 from qwen3_code.theme import console, SAKURA, SAKURA_DEEP, SAKURA_DARK, SAKURA_MUTED
-from qwen3_code.settings import CFG, handle_settings, SETTINGS_PATH, SIZE_REDUCTION_THRESHOLD  # noqa: F401
+from qwen3_code.settings import CFG, handle_settings, SETTINGS_PATH
 from qwen3_code.utils import (
     _short_cwd, resolve_path, read_file, run_command,
-    VC_DIR, SESSION_DIR, STREAM_MAX_LINES,
+    VC_DIR, SESSION_DIR, STREAM_MAX_LINES, SIZE_REDUCTION_THRESHOLD,
 )
 from qwen3_code.session import save_session, load_session, _session_path
 from qwen3_code.vc import (
@@ -21,9 +21,6 @@ from qwen3_code.vc import (
 )
 from qwen3_code.refresh import handle_refresh
 from qwen3_code.renderer import stream_response
-
-# settings import for SIZE_REDUCTION_THRESHOLD
-from qwen3_code.utils import SIZE_REDUCTION_THRESHOLD  # already there via utils
 
 # ---------------------------------------------------------------------------
 # /help table
