@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-qwen3-code: A simple Claude Code-style TUI powered by Ollama + huihui_ai/qwen3-coder-abliterated:30b
+qwen3-code: A simple Claude Code-style TUI powered by Ollama.
+Settings are read from / saved to settings.json next to this file.
 """
 
 import argparse
@@ -28,9 +29,8 @@ try:
     from rich.console import Console
     from rich.markdown import Markdown
     from rich.panel import Panel
-    from rich.prompt import Prompt
-    from rich.syntax import Syntax
     from rich.table import Table
+    from rich.syntax import Syntax
     from rich.theme import Theme
     from rich.text import Text
 except ImportError:
@@ -45,12 +45,56 @@ try:
 except ImportError:
     _PT_AVAILABLE = False
 
-# -- Constants -----------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
 
-MODEL: str              = "huihui_ai/qwen3-coder-abliterated:30b"
-VC_DIR: Path            = Path.home() / ".local" / "share" / "qwen3-code" / "vc"
-SESSION_DIR: Path       = Path.home() / ".local" / "share" / "qwen3-code" / "sessions"
-STREAM_MAX_LINES: int   = 10   # rolling window height during streaming
+SETTINGS_PATH: Path = Path(__file__).parent / "settings.json"
+
+DEFAULT_SETTINGS: dict = {
+    "app_name":              "qwen3-code",
+    "assistant_name":        "assistant",
+    "model":                 "huihui_ai/qwen3-coder-abliterated:30b",
+    "open_from_last_session": True,
+}
+
+_SETTINGS_HELP: dict[str, str] = {
+    "app_name":               "Display name shown in the header and panels",
+    "assistant_name":         "Label used when the AI is thinking / responding",
+    "model":                  "Ollama model tag to use for all inference",
+    "open_from_last_session": "true/false  — resume previous conversation on startup",
+}
+
+
+def load_settings() -> dict:
+    if SETTINGS_PATH.exists():
+        try:
+            data: dict = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+            return {**DEFAULT_SETTINGS, **data}
+        except Exception:
+            pass
+    return DEFAULT_SETTINGS.copy()
+
+
+def save_settings(settings: dict) -> None:
+    SETTINGS_PATH.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+
+
+# Load once at import time; mutated by /settings command.
+CFG: dict = load_settings()
+
+# Convenience aliases — read these everywhere instead of the old MODULE constant.
+def _model()          -> str:  return CFG["model"]
+def _app_name()       -> str:  return CFG["app_name"]
+def _assistant_name() -> str:  return CFG["assistant_name"]
+
+# ---------------------------------------------------------------------------
+# Other constants
+# ---------------------------------------------------------------------------
+
+VC_DIR: Path      = Path.home() / ".local" / "share" / "qwen3-code" / "vc"
+SESSION_DIR: Path = Path.home() / ".local" / "share" / "qwen3-code" / "sessions"
+STREAM_MAX_LINES: int = 10
 
 _PARTIAL_REPROMPT: str = (
     "Your last response contained a partial file (it included truncation markers like "
@@ -88,14 +132,14 @@ SYSTEM_PROMPT: str = textwrap.dedent("""\
     user can /undo at any time.
 """).strip()
 
-# -- Sakura palette ------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Colour palette
+# ---------------------------------------------------------------------------
 
 SAKURA: str       = "#FFB7C5"
 SAKURA_DEEP: str  = "#FF69B4"
 SAKURA_MUTED: str = "#FFCDD6"
 SAKURA_DARK: str  = "#C2185B"
-
-# -- UI setup ------------------------------------------------------------------
 
 custom_theme: Theme = Theme({
     "user":      f"bold {SAKURA_DEEP}",
@@ -107,7 +151,9 @@ custom_theme: Theme = Theme({
 
 console: Console = Console(theme=custom_theme)
 
-# -- Help table builder --------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Help table
+# ---------------------------------------------------------------------------
 
 def _help_table() -> Table:
     t = Table(show_header=False, box=None, padding=(0, 1), expand=True)
@@ -126,6 +172,7 @@ def _help_table() -> Table:
         ("/clear",                "clear conversation history"),
         ("/check <target>",       f"AI code review  {D}ALL | file | file:func{E}"),
         ("/stackview <type>",     f"inspect state  {D}fh / fhf / sessions / env{E}"),
+        ("/settings [key val]",   f"view/edit settings  {D}(saved to settings.json){E}"),
         ("/history",              "show message history"),
         ("/help",                 "show this help"),
         ("/quit",                 "exit"),
@@ -149,7 +196,93 @@ def _help_table() -> Table:
     return t
 
 
-# -- Path helpers --------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# /settings handler
+# ---------------------------------------------------------------------------
+
+def handle_settings(arg: str) -> None:
+    """Show all settings, or set a single key.
+
+    Usage:
+        /settings                     — print current values
+        /settings <key>               — print one value
+        /settings <key> <value>       — update one value
+    """
+    parts: list[str] = arg.strip().split(maxsplit=1)
+
+    if not parts:
+        # Display all current settings.
+        rows: list[str] = []
+        for k, v in CFG.items():
+            default_tag = " [dim](default)[/dim]" if v == DEFAULT_SETTINGS.get(k) else ""
+            help_text   = _SETTINGS_HELP.get(k, "")
+            rows.append(
+                f"  [bold cyan]{k:<30}[/bold cyan]  [bold]{v}[/bold]{default_tag}\n"
+                f"  [dim]{help_text}[/dim]"
+            )
+        console.print(Panel(
+            "\n".join(rows),
+            title=f"Settings  ({SETTINGS_PATH})",
+            border_style=SAKURA_DEEP,
+        ))
+        return
+
+    key: str = parts[0].lower()
+
+    # Validate key.
+    if key not in DEFAULT_SETTINGS:
+        valid: str = ", ".join(DEFAULT_SETTINGS.keys())
+        console.print(f"[error]Unknown setting '{key}'. Valid keys: {valid}[/error]")
+        return
+
+    if len(parts) == 1:
+        # Just show the one setting.
+        console.print(
+            f"[bold cyan]{key}[/bold cyan] = [bold]{CFG[key]}[/bold]  "
+            f"[dim]{_SETTINGS_HELP.get(key, '')}[/dim]"
+        )
+        return
+
+    raw_val: str = parts[1].strip()
+
+    # Type coercion.
+    expected = DEFAULT_SETTINGS[key]
+    if isinstance(expected, bool):
+        if raw_val.lower() in ("true", "1", "yes", "on"):
+            value = True
+        elif raw_val.lower() in ("false", "0", "no", "off"):
+            value = False
+        else:
+            console.print(f"[error]'{key}' expects true/false, got '{raw_val}'[/error]")
+            return
+    elif isinstance(expected, int):
+        try:
+            value = int(raw_val)
+        except ValueError:
+            console.print(f"[error]'{key}' expects an integer, got '{raw_val}'[/error]")
+            return
+    else:
+        value = raw_val
+
+    old_val = CFG[key]
+    CFG[key] = value
+    save_settings(CFG)
+    console.print(
+        f"[info][bold cyan]{key}[/bold cyan]: "
+        f"[dim]{old_val}[/dim] → [bold]{value}[/bold]  saved to {SETTINGS_PATH}[/info]"
+    )
+
+    # Notify if model changed — user may need to pull it.
+    if key == "model":
+        console.print(
+            f"[info]Model changed. Make sure it is available locally:\n"
+            f"  ollama pull {value}[/info]"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Path helpers
+# ---------------------------------------------------------------------------
 
 def _short_cwd(cwd: str) -> str:
     parts: list[str] = Path(cwd).parts
@@ -158,7 +291,9 @@ def _short_cwd(cwd: str) -> str:
     return os.path.join(parts[-2], parts[-1])
 
 
-# -- Session persistence -------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Session persistence
+# ---------------------------------------------------------------------------
 
 def _session_path(cwd: str) -> Path:
     safe: str = re.sub(r"[^\w.\-]", "_", cwd)
@@ -178,6 +313,8 @@ def save_session(cwd: str, messages: list[dict]) -> None:
 
 def load_session(cwd: str) -> list[dict]:
     base: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if not CFG.get("open_from_last_session", True):
+        return base
     path: Path = _session_path(cwd)
     if not path.exists():
         return base
@@ -198,11 +335,11 @@ def load_session(cwd: str) -> list[dict]:
         return base
 
 
-# ==============================================================================
+# ===========================================================================
 # Git-like version control
-# ==============================================================================
+# ===========================================================================
 
-_VC_CACHE: dict[str, dict] = {}   # filepath -> loaded VC index
+_VC_CACHE: dict[str, dict] = {}
 
 
 def _vc_slot(filepath: str) -> Path:
@@ -271,7 +408,7 @@ def _generate_commit_message(filepath: str, old_content: str, new_content: str) 
     console.print(f"[info]Generating commit message...[/info]", end="")
     try:
         resp = ollama.chat(
-            model=MODEL,
+            model=_model(),
             messages=[{"role": "user", "content": prompt}],
             stream=False,
         )
@@ -370,7 +507,9 @@ def write_file_with_vc(
     ))
 
 
-# -- VC navigation commands ----------------------------------------------------
+# ---------------------------------------------------------------------------
+# VC navigation
+# ---------------------------------------------------------------------------
 
 def _resolve_commit(filepath: str, id_prefix: str) -> str | None:
     idx: dict = _load_vc(filepath)
@@ -574,7 +713,9 @@ def _all_tracked_files() -> list[str]:
     return result
 
 
-# -- General helpers -----------------------------------------------------------
+# ---------------------------------------------------------------------------
+# General helpers
+# ---------------------------------------------------------------------------
 
 def read_file(path: str) -> str:
     try:
@@ -611,7 +752,9 @@ def resolve_path(arg: str, cwd: str) -> str:
     return str(p) if p.is_absolute() else str(Path(cwd) / p)
 
 
-# -- Partial-write detection ---------------------------------------------------
+# ---------------------------------------------------------------------------
+# Partial-write detection
+# ---------------------------------------------------------------------------
 
 _PARTIAL_PATTERNS: list[re.Pattern] = [
     re.compile(r"^\s*\.{3}\s*$",                       re.MULTILINE),
@@ -674,19 +817,22 @@ def apply_command_runs(reply: str, cwd: str, messages: list[dict]) -> None:
         messages.append({"role": "user", "content": f"[Command `{cmd}` was run. Output:]\n```\n{output}\n```"})
 
 
-# -- Tab-completion ------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Tab-completion
+# ---------------------------------------------------------------------------
 
 _SLASH_COMMANDS: list[str] = [
     "/cd", "/read", "/run", "/undo", "/redo", "/files",
-    "/clear", "/check", "/stackview", "/history", "/help",
+    "/clear", "/check", "/stackview", "/settings", "/history", "/help",
     "/commit", "/log", "/checkout",
     "/quit", "/exit", "/q",
 ]
 
 _CMD_SUBARGS: dict[str, list[str]] = {
     "/stackview": ["fh", "fhf", "sessions", "sess", "stack", "env", "environment", "help"],
-    "/check": ["ALL"],
-    "/read":  ["-a"],
+    "/check":     ["ALL"],
+    "/read":      ["-a"],
+    "/settings":  list(DEFAULT_SETTINGS.keys()),
 }
 
 _FILE_COMMANDS: set[str] = {"/read", "/check", "/undo", "/redo", "/files", "/cd", "/commit", "/log", "/checkout"}
@@ -748,7 +894,9 @@ if _PT_AVAILABLE:
                     pass
 
 
-# -- Fuzzy hint completions ----------------------------------------------------
+# ---------------------------------------------------------------------------
+# Fuzzy hint completions
+# ---------------------------------------------------------------------------
 
 def _get_fuzzy_completions(text: str, cwd: str) -> list[str]:
     if not text.startswith("/"):
@@ -791,7 +939,9 @@ def _get_fuzzy_completions(text: str, cwd: str) -> list[str]:
     return results
 
 
-# -- VT enable -----------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# VT enable
+# ---------------------------------------------------------------------------
 
 def _enable_windows_vt() -> None:
     if sys.platform != "win32":
@@ -811,7 +961,9 @@ def _enable_windows_vt() -> None:
         pass
 
 
-# -- Inline prompt with fuzzy hint above ---------------------------------------
+# ---------------------------------------------------------------------------
+# Inline prompt with fuzzy hint
+# ---------------------------------------------------------------------------
 
 def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
     _enable_windows_vt()
@@ -984,7 +1136,9 @@ def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
     return _text()
 
 
-# -- /check helpers ------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# /check helpers
+# ---------------------------------------------------------------------------
 
 _CODE_EXTENSIONS: set[str] = {
     ".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs",
@@ -1124,7 +1278,9 @@ def handle_check(arg: str, messages: list[dict], state: dict) -> None:
         save_session(cwd, messages)
 
 
-# -- /stackview ----------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# /stackview
+# ---------------------------------------------------------------------------
 
 _SV_TYPES: dict[str, str] = {
     "fh":       "File history  (current project)",
@@ -1196,13 +1352,17 @@ def _sv_sessions() -> None:
 def _sv_env(cwd: str, messages: list[dict]) -> None:
     sf: Path = _session_path(cwd)
     rows: list[str] = [
-        f"  Model        : {MODEL}",
-        f"  CWD          : {cwd}",
-        f"  VC dir       : {VC_DIR}",
-        f"  Session dir  : {SESSION_DIR}",
-        f"  Session file : {sf}  ({'  ' + str(sf.stat().st_size) + ' B' if sf.exists() else '(no session file)'})",
-        f"  Messages     : {len([m for m in messages if m['role'] != 'system'])} in current session",
-        f"  Python       : {sys.version.split()[0]}  ({sys.executable})",
+        f"  Model             : {_model()}",
+        f"  App name          : {_app_name()}",
+        f"  Assistant name    : {_assistant_name()}",
+        f"  Resume session    : {CFG.get('open_from_last_session')}",
+        f"  Settings file     : {SETTINGS_PATH}  ({'exists' if SETTINGS_PATH.exists() else 'not created yet'})",
+        f"  CWD               : {cwd}",
+        f"  VC dir            : {VC_DIR}",
+        f"  Session dir       : {SESSION_DIR}",
+        f"  Session file      : {sf}  ({'  ' + str(sf.stat().st_size) + ' B' if sf.exists() else '(no session file)'})",
+        f"  Messages          : {len([m for m in messages if m['role'] != 'system'])} in current session",
+        f"  Python            : {sys.version.split()[0]}  ({sys.executable})",
     ]
     console.print(Panel("\n".join(rows), title="Environment", border_style=SAKURA_DEEP))
 
@@ -1221,7 +1381,9 @@ def handle_stackview(sv_type: str, cwd: str, messages: list[dict]) -> None:
         console.print(f"[error]Unknown stackview type: '{t}'. Run /stackview help.[/error]")
 
 
-# -- Slash commands ------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Slash command dispatcher
+# ---------------------------------------------------------------------------
 
 def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
     parts: list[str] = cmd.strip().split(maxsplit=1)
@@ -1409,6 +1571,9 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
     elif name == "/stackview":
         handle_stackview(arg, cwd, messages)
 
+    elif name == "/settings":
+        handle_settings(arg)
+
     elif name == "/commit":
         if not arg:
             console.print("[error]Usage: /commit <filepath> [message][/error]")
@@ -1442,7 +1607,9 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
     return True
 
 
-# -- Response rendering --------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Response rendering
+# ---------------------------------------------------------------------------
 
 def render_response(text: str) -> None:
     _CODE_BLOCK_RE = re.compile(r"(```(?:\w+)?\n.*?```)", re.DOTALL)
@@ -1472,7 +1639,9 @@ def render_response(text: str) -> None:
                 console.print(Markdown(cleaned))
 
 
-# -- Streaming -----------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Streaming
+# ---------------------------------------------------------------------------
 
 def _watch_for_cancel(cancel_event: threading.Event) -> None:
     try:
@@ -1503,9 +1672,9 @@ def _status_line(left: str, right: str) -> Text:
     plain_left: str = re.sub(r"\[/?[^\]]*\]", "", left)
     pad: int        = max(1, width - len(plain_left) - len(right))
     line: Text = Text()
-    line.append("assistant", style=f"bold {SAKURA}")
+    line.append(_assistant_name(), style=f"bold {SAKURA}")
     line.append("  ", style="")
-    line.append(left.replace("assistant  ", ""), style="dim")
+    line.append(left.replace(_assistant_name() + "  ", ""), style="dim")
     line.append(" " * pad, style="")
     line.append(right, style=f"dim {SAKURA_MUTED}")
     return line
@@ -1516,83 +1685,58 @@ def _raw_stream(
     cancel_event: threading.Event | None = None,
 ) -> tuple[str, int]:
     """
-    Stream tokens from Ollama with a rolling STREAM_MAX_LINES-line window.
-
-    The terminal shows at most STREAM_MAX_LINES complete lines at once;
-    when a new line would exceed the limit the oldest is dropped and the
-    window redraws in-place.  The current (incomplete) partial line is
-    always shown below the window.
-
-    Returns (full_text, rendered_rows) where rendered_rows is the number
-    of terminal rows currently occupied by the stream output.  The caller
-    is responsible for erasing those rows (plus any rows above like the
-    status line) before rendering the final markdown.
+    Stream tokens with a rolling STREAM_MAX_LINES-line window.
+    Returns (full_text, rendered_rows).
     """
     full: str          = ""
-    window: list[str]  = []   # complete lines in the visible window
-    partial: str       = ""   # current incomplete line being built
-    rendered_rows: int = 0    # total rows on screen (window lines + partial line)
+    window: list[str]  = []
+    partial: str       = ""
+    rendered_rows: int = 0
 
     def _redraw() -> None:
-        """Redraw the entire window + partial in place."""
         nonlocal rendered_rows
-        # Move cursor back to the top of our window area.
-        # rendered_rows - 1 = number of lines ABOVE the partial (i.e. window lines).
         lines_above = rendered_rows - 1
         if lines_above > 0:
             sys.stdout.write(f"\033[{lines_above}A")
         sys.stdout.write("\r")
-        # Write each window line, clearing to end-of-line.
         for line in window:
             sys.stdout.write("\033[2K" + line + "\n")
-        # Write the partial line (no trailing newline).
         sys.stdout.write("\033[2K" + partial)
         sys.stdout.flush()
-        rendered_rows = len(window) + 1   # window lines + partial line
+        rendered_rows = len(window) + 1
 
     try:
-        for chunk in ollama.chat(model=MODEL, messages=messages, stream=True):
+        for chunk in ollama.chat(model=_model(), messages=messages, stream=True):
             if cancel_event and cancel_event.is_set():
                 break
             token: str = chunk["message"]["content"]
             full += token
 
             if "\n" in token:
-                # Split on newlines; each split boundary means a line was completed.
                 parts: list[str] = token.split("\n")
-
-                # First segment completes the current partial.
                 partial += parts[0]
                 window.append(partial)
                 if len(window) > STREAM_MAX_LINES:
                     window = window[-STREAM_MAX_LINES:]
-
-                # Middle segments are complete lines with no further content yet.
                 for mid in parts[1:-1]:
                     window.append(mid)
                     if len(window) > STREAM_MAX_LINES:
                         window = window[-STREAM_MAX_LINES:]
-
-                # Last segment starts the new partial line.
                 partial = parts[-1]
                 _redraw()
-
             else:
-                # No newline: extend partial and overwrite only the bottom line.
                 partial += token
                 if rendered_rows == 0:
-                    # First token ever — just write it; cursor stays on same line.
                     sys.stdout.write(partial)
                     rendered_rows = 1
                 else:
-                    # Cursor is already on the partial line; overwrite it.
                     sys.stdout.write("\r\033[2K" + partial)
                 sys.stdout.flush()
 
     except Exception as exc:
         if not (cancel_event and cancel_event.is_set()):
             console.print(f"[error]Ollama error: {exc}[/error]")
-            console.print(f"[info]  ollama pull {MODEL}[/info]")
+            console.print(f"[info]  ollama pull {_model()}[/info]")
 
     return full, rendered_rows
 
@@ -1600,8 +1744,6 @@ def _raw_stream(
 def stream_response(messages: list[dict], cwd: str = "") -> str:
     cancel_event: threading.Event = threading.Event()
 
-    # Print a blank line then the status bar.
-    # These 2 lines are counted when clearing after streaming.
     console.print()
     console.print(_status_line("thinking...", "ctrl+d to cancel"))
 
@@ -1610,26 +1752,26 @@ def stream_response(messages: list[dict], cwd: str = "") -> str:
     )
     watcher.start()
     full_reply, window_rows = _raw_stream(messages, cancel_event)
-    cancel_event.set()
+
+    # Capture whether the USER cancelled before we set the event ourselves.
+    user_cancelled: bool = cancel_event.is_set()
+    cancel_event.set()   # stop watcher regardless
     watcher.join(timeout=0.5)
 
-    # ------------------------------------------------------------------ clear
-    # Erase the stream window AND the 2 header lines (blank + status bar).
-    #
-    # Cursor is currently at the end of the partial line, which is:
-    #   window_rows - 1  lines below the start of the window area
-    #   + 2              lines below the blank/status lines
-    # So total cursor-up needed to reach the blank line:
-    #   (window_rows - 1) + 2  =  window_rows + 1  (for window_rows >= 1)
-    #   or simply 2            (for window_rows == 0, nothing was printed)
+    # Clear stream window + blank line + status bar.
     clear_rows: int = max(2, window_rows + 1)
     sys.stdout.write(f"\033[{clear_rows}A\r\033[J")
     sys.stdout.flush()
-    # -------------------------------------------------------------------/ clear
 
     if not full_reply:
-        if cancel_event.is_set():
+        if user_cancelled:
             console.print("[info]Cancelled.[/info]")
+        return full_reply
+
+    if user_cancelled:
+        # Show whatever came through, but DO NOT write files or run commands.
+        console.print("[info]Cancelled — partial response shown, no files written.[/info]")
+        render_response(full_reply)
         return full_reply
 
     if _reply_has_partial_write(full_reply):
@@ -1647,21 +1789,25 @@ def stream_response(messages: list[dict], cwd: str = "") -> str:
         )
         rw.start()
         rr, rw_rows = _raw_stream(messages, rc)
+        rc_cancelled: bool = rc.is_set()
         rc.set(); rw.join(timeout=0.5)
         clear_rows_r = max(2, rw_rows + 1)
         sys.stdout.write(f"\033[{clear_rows_r}A\r\033[J")
         sys.stdout.flush()
         messages.pop(); messages.pop()
-        if rr:
+        if rr and not rc_cancelled:
             full_reply = rr
 
     render_response(full_reply)
-    apply_file_writes(full_reply)
-    apply_command_runs(full_reply, cwd, messages)
+    if not user_cancelled:
+        apply_file_writes(full_reply)
+        apply_command_runs(full_reply, cwd, messages)
     return full_reply
 
 
-# -- Main loop -----------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="qwen3-code")
@@ -1675,7 +1821,6 @@ def main() -> None:
         if not target.is_dir(): print(f"[error] Not a directory: {raw_dir}"); sys.exit(1)
         os.chdir(target)
 
-    # Enable VT processing early so ANSI codes work in the stream window on Windows.
     _enable_windows_vt()
 
     VC_DIR.mkdir(parents=True, exist_ok=True)
@@ -1684,12 +1829,13 @@ def main() -> None:
     initial_cwd: str = os.getcwd()
     state: dict      = {"cwd": initial_cwd, "first_message": True, "pending_context": []}
 
+    app: str = _app_name()
     console.print(Panel(
-        f"[bold {SAKURA_DEEP}]qwen3-code[/bold {SAKURA_DEEP}]  -  simple coding assistant TUI\n"
-        f"Model : [{SAKURA}]{MODEL}[/{SAKURA}]\n"
+        f"[bold {SAKURA_DEEP}]{app}[/bold {SAKURA_DEEP}]  -  simple coding assistant TUI\n"
+        f"Model : [{SAKURA}]{_model()}[/{SAKURA}]\n"
         f"CWD   : [{SAKURA}]{initial_cwd}[/{SAKURA}]\n\n"
-        f"Type [{SAKURA_DEEP}]/help[/{SAKURA_DEEP}] for commands, [{SAKURA_DEEP}]/quit[/{SAKURA_DEEP}] to exit.",
-        border_style=SAKURA, title="qwen3-code",
+        f"Type [{SAKURA_DEEP}]/help[/{SAKURA_DEEP}] for commands, [{SAKURA_DEEP}]/settings[/{SAKURA_DEEP}] to configure, [{SAKURA_DEEP}]/quit[/{SAKURA_DEEP}] to exit.",
+        border_style=SAKURA, title=app,
     ))
 
     messages: list[dict] = load_session(initial_cwd)
@@ -1730,9 +1876,14 @@ def main() -> None:
 
         messages.append({"role": "user", "content": content})
         reply: str = stream_response(messages, cwd)
-        if reply:
+        if reply and not cancel_event_was_set_check(reply):
             messages.append({"role": "assistant", "content": reply})
             save_session(cwd, messages)
+
+
+def cancel_event_was_set_check(reply: str) -> bool:
+    """Dummy — reply is always appended; kept for clarity in main loop."""
+    return False
 
 
 if __name__ == "__main__":
