@@ -820,18 +820,11 @@ def _all_tracked_files() -> list[str]:
 # /refresh
 # ---------------------------------------------------------------------------
 
-# Pattern that matches a single-file context block injected by /read:
-#   "Here is the content of `<path>`:\n\n```...\n```"
-# We anchor at the *start* of the string so we can detect messages that are
-# *entirely* a file-context block (possibly with a trailing user question
-# appended after two newlines).
 _READ_BLOCK_RE: re.Pattern = re.compile(
     r"Here is the content of `(?P<path>[^`]+)`:\s*\n\n```[^\n]*\n(?P<body>.*?)\n?```",
     re.DOTALL,
 )
 
-# Pattern for the bulk /read -a block:
-#   "Here are all N file(s) from `<cwd>`:\n\n### <rel>\n```\n...\n```\n..."
 _READ_ALL_BLOCK_RE: re.Pattern = re.compile(
     r"Here are all \d+ file\(s\) from `[^`]+`:\n\n",
     re.DOTALL,
@@ -839,32 +832,18 @@ _READ_ALL_BLOCK_RE: re.Pattern = re.compile(
 
 
 def _strip_file_blocks(content: str, gone_set: set[str]) -> str:
-    """Remove /read-style code blocks for files in *gone_set* from a message.
-
-    Handles:
-    1. Single-file blocks that appear anywhere in the message.
-    2. "### <rel>\n```\n...\n```" sub-blocks inside a /read -a block — only
-       removes the sub-blocks whose resolved path is in gone_set; the header
-       line is updated to reflect the new count.
-    """
-    # 1. Strip individual single-file blocks whose path is gone.
     def _remove_single(m: re.Match) -> str:
         fp: str = m.group("path")
         if fp in gone_set or str(Path(fp).resolve()) in gone_set:
-            return ""  # drop
-        return m.group(0)  # keep
+            return ""
+        return m.group(0)
 
     content = _READ_BLOCK_RE.sub(_remove_single, content)
 
-    # 2. Strip sub-blocks inside /read -a blocks.
-    #    Sub-block format:  ### <rel>\n```\n...\n```
     _SUB_RE = re.compile(r"### (?P<rel>[^\n]+)\n```[^\n]*\n.*?```", re.DOTALL)
 
     def _fix_bulk(m: re.Match) -> str:
-        header: str = m.group(0)[: m.start(0) - m.start(0)]  # unused
-        # Re-process the full match (header + sub-blocks)
         full: str = m.group(0)
-        # Separate the "Here are all N file(s) from..." header
         nl2: int = full.find("\n\n")
         if nl2 == -1:
             return full
@@ -874,7 +853,6 @@ def _strip_file_blocks(content: str, gone_set: set[str]) -> str:
         kept: list[str] = []
         for sub in _SUB_RE.finditer(rest):
             rel: str = sub.group("rel").strip()
-            # Try to find the absolute path in gone_set.
             gone: bool = False
             for g in gone_set:
                 if g.endswith(os.sep + rel) or g.endswith("/" + rel) or Path(g).name == rel:
@@ -884,9 +862,8 @@ def _strip_file_blocks(content: str, gone_set: set[str]) -> str:
                 kept.append(sub.group(0))
 
         if not kept:
-            return ""  # all files gone — drop the whole block
+            return ""
 
-        # Update the count in the header.
         new_intro: str = re.sub(
             r"Here are all \d+ file\(s\)",
             f"Here are all {len(kept)} file(s)",
@@ -894,7 +871,6 @@ def _strip_file_blocks(content: str, gone_set: set[str]) -> str:
         )
         return new_intro + "\n\n".join(kept)
 
-    # Apply the bulk-block fix only to matching regions.
     content = re.sub(
         r"Here are all \d+ file\(s\) from `[^`]+`:\n\n(?:### [^\n]+\n```[^\n]*\n.*?```\n?)+",
         _fix_bulk,
@@ -906,10 +882,7 @@ def _strip_file_blocks(content: str, gone_set: set[str]) -> str:
 
 
 def handle_refresh(messages: list[dict], state: dict) -> None:
-    """Reload tracked files, update context, and prune references to deleted files."""
     cwd: str = state["cwd"]
-
-    # ---- 1. Collect all tracked files under cwd --------------------------
     tracked: list[str] = _all_tracked_files()
     local: list[str]   = [fp for fp in tracked if fp.startswith(cwd)]
 
@@ -917,7 +890,7 @@ def handle_refresh(messages: list[dict], state: dict) -> None:
         console.print("[info]No tracked files under current directory. Use /read to load files.[/info]")
         return
 
-    refreshed: list[tuple[str, str]] = []  # (abs_path, new_content)
+    refreshed: list[tuple[str, str]] = []
     unchanged: list[str]             = []
     gone: list[str]                  = []
 
@@ -931,7 +904,6 @@ def handle_refresh(messages: list[dict], state: dict) -> None:
             gone.append(fp)
             continue
 
-        # Compare with HEAD snapshot to decide changed/unchanged.
         old_content: str = ""
         idx: dict = _load_vc(fp)
         head_id: str | None = idx.get("head")
@@ -948,7 +920,6 @@ def handle_refresh(messages: list[dict], state: dict) -> None:
 
     gone_set: set[str] = set(gone)
 
-    # ---- 2. Prune stale messages that reference gone files ----------------
     pruned: int = 0
     new_messages: list[dict] = []
     for msg in messages:
@@ -958,7 +929,6 @@ def handle_refresh(messages: list[dict], state: dict) -> None:
         original: str = msg["content"]
         cleaned: str  = _strip_file_blocks(original, gone_set) if gone else original
         if not cleaned.strip():
-            # Message is now empty — drop it entirely.
             pruned += 1
             continue
         if cleaned != original:
@@ -968,7 +938,6 @@ def handle_refresh(messages: list[dict], state: dict) -> None:
             new_messages.append(msg)
     messages[:] = new_messages
 
-    # ---- 3. Prune pending_context ----------------------------------------
     new_pending: list[str] = []
     for ctx in state.get("pending_context", []):
         cleaned_ctx: str = _strip_file_blocks(ctx, gone_set) if gone else ctx
@@ -976,15 +945,12 @@ def handle_refresh(messages: list[dict], state: dict) -> None:
             new_pending.append(cleaned_ctx)
     state["pending_context"] = new_pending
 
-    # ---- 4. Re-inject updated file content into pending_context ----------
     for fp, content in refreshed:
         state.setdefault("pending_context", []).append(
             f"Here is the content of `{fp}`:\n\n```\n{content}\n```"
         )
-        # Also commit the refreshed snapshot to VC.
         _vc_commit(fp, content, "Refresh snapshot")
 
-    # ---- 5. Report -------------------------------------------------------
     report_lines: list[str] = []
 
     if refreshed:
@@ -1196,10 +1162,6 @@ if _PT_AVAILABLE:
                     pass
 
 
-# ---------------------------------------------------------------------------
-# Fuzzy hint completions
-# ---------------------------------------------------------------------------
-
 def _get_fuzzy_completions(text: str, cwd: str) -> list[str]:
     if not text.startswith("/"):
         return []
@@ -1241,10 +1203,6 @@ def _get_fuzzy_completions(text: str, cwd: str) -> list[str]:
     return results
 
 
-# ---------------------------------------------------------------------------
-# VT enable
-# ---------------------------------------------------------------------------
-
 def _enable_windows_vt() -> None:
     if sys.platform != "win32":
         return
@@ -1262,10 +1220,6 @@ def _enable_windows_vt() -> None:
     except Exception:
         pass
 
-
-# ---------------------------------------------------------------------------
-# Inline prompt with fuzzy hint
-# ---------------------------------------------------------------------------
 
 def _inline_prompt(prompt_str: str, cwd: str, history: list[str]) -> str:
     _enable_windows_vt()
@@ -1991,14 +1945,6 @@ def _raw_stream(
     messages: list[dict],
     cancel_event: threading.Event | None = None,
 ) -> tuple[str, int]:
-    """Stream tokens with a rolling STREAM_MAX_LINES-line window.
-
-    Tracks *physical* terminal rows (accounting for line-wrapping) so that
-    the cursor-up calculations are correct even when a single logical line
-    is wider than the terminal.
-
-    Returns (full_text, total_physical_rows_on_screen).
-    """
     full: str          = ""
     window: list[str]  = []
     partial: str       = ""
@@ -2071,6 +2017,12 @@ def _raw_stream(
 
 
 def stream_response(messages: list[dict], cwd: str = "") -> str:
+    """Stream a response from the model.
+
+    Ctrl+D at any point (initial stream OR partial-write retry) sets the
+    cancel flag.  When cancelled, the partial text is rendered for the user
+    but NO files are written and NO commands are run.
+    """
     cancel_event: threading.Event = threading.Event()
 
     console.print()
@@ -2090,16 +2042,19 @@ def stream_response(messages: list[dict], cwd: str = "") -> str:
     sys.stdout.write(f"\033[{clear_rows}A\r\033[J")
     sys.stdout.flush()
 
+    # ---- Empty response --------------------------------------------------
     if not full_reply:
         if user_cancelled:
             console.print("[info]Cancelled.[/info]")
         return full_reply
 
+    # ---- Cancelled during initial stream — show text, skip all writes ----
     if user_cancelled:
         console.print("[info]Cancelled \u2014 partial response shown, no files written.[/info]")
         render_response(full_reply)
         return full_reply
 
+    # ---- Partial-write detected — retry, but honour Ctrl+D again ---------
     if _reply_has_partial_write(full_reply):
         console.print(Panel(
             "[info]Partial file detected. Reprompting...[/info]",
@@ -2116,14 +2071,25 @@ def stream_response(messages: list[dict], cwd: str = "") -> str:
         rw.start()
         rr, rw_rows = _raw_stream(messages, rc)
         rc_cancelled: bool = rc.is_set()
-        rc.set(); rw.join(timeout=0.5)
+        rc.set()
+        rw.join(timeout=0.5)
         clear_rows_r = max(2, rw_rows + 1)
         sys.stdout.write(f"\033[{clear_rows_r}A\r\033[J")
         sys.stdout.flush()
-        messages.pop(); messages.pop()
-        if rr and not rc_cancelled:
+        # Always pop the temporary retry messages
+        messages.pop()
+        messages.pop()
+
+        if rc_cancelled:
+            # User cancelled during retry — show whatever we got, no writes
+            console.print("[info]Cancelled \u2014 partial response shown, no files written.[/info]")
+            render_response(rr or full_reply)
+            return rr or full_reply
+
+        if rr:
             full_reply = rr
 
+    # ---- Normal path — render then apply writes/runs ---------------------
     render_response(full_reply)
     apply_file_writes(full_reply)
     apply_command_runs(full_reply, cwd, messages)
