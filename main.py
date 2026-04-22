@@ -210,6 +210,7 @@ def _help_table() -> Table:
         ("/cd [dir]",             "change working directory"),
         ("/read <file>",          f"load file into context  {D}(saves baseline snapshot){E}"),
         ("/read -a",              f"load ALL files recursively  {D}(saves baseline snapshots){E}"),
+        ("/refresh",              f"reload tracked files, prune stale context  {D}(gone files removed){E}"),
         ("/run <cmd>",            "run a shell command"),
         ("/clear",                "clear conversation history"),
         ("/check <target>",       f"AI code review  {D}ALL | file | file:func{E}"),
@@ -816,6 +817,205 @@ def _all_tracked_files() -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# /refresh
+# ---------------------------------------------------------------------------
+
+# Pattern that matches a single-file context block injected by /read:
+#   "Here is the content of `<path>`:\n\n```...\n```"
+# We anchor at the *start* of the string so we can detect messages that are
+# *entirely* a file-context block (possibly with a trailing user question
+# appended after two newlines).
+_READ_BLOCK_RE: re.Pattern = re.compile(
+    r"Here is the content of `(?P<path>[^`]+)`:\s*\n\n```[^\n]*\n(?P<body>.*?)\n?```",
+    re.DOTALL,
+)
+
+# Pattern for the bulk /read -a block:
+#   "Here are all N file(s) from `<cwd>`:\n\n### <rel>\n```\n...\n```\n..."
+_READ_ALL_BLOCK_RE: re.Pattern = re.compile(
+    r"Here are all \d+ file\(s\) from `[^`]+`:\n\n",
+    re.DOTALL,
+)
+
+
+def _strip_file_blocks(content: str, gone_set: set[str]) -> str:
+    """Remove /read-style code blocks for files in *gone_set* from a message.
+
+    Handles:
+    1. Single-file blocks that appear anywhere in the message.
+    2. "### <rel>\n```\n...\n```" sub-blocks inside a /read -a block — only
+       removes the sub-blocks whose resolved path is in gone_set; the header
+       line is updated to reflect the new count.
+    """
+    # 1. Strip individual single-file blocks whose path is gone.
+    def _remove_single(m: re.Match) -> str:
+        fp: str = m.group("path")
+        if fp in gone_set or str(Path(fp).resolve()) in gone_set:
+            return ""  # drop
+        return m.group(0)  # keep
+
+    content = _READ_BLOCK_RE.sub(_remove_single, content)
+
+    # 2. Strip sub-blocks inside /read -a blocks.
+    #    Sub-block format:  ### <rel>\n```\n...\n```
+    _SUB_RE = re.compile(r"### (?P<rel>[^\n]+)\n```[^\n]*\n.*?```", re.DOTALL)
+
+    def _fix_bulk(m: re.Match) -> str:
+        header: str = m.group(0)[: m.start(0) - m.start(0)]  # unused
+        # Re-process the full match (header + sub-blocks)
+        full: str = m.group(0)
+        # Separate the "Here are all N file(s) from..." header
+        nl2: int = full.find("\n\n")
+        if nl2 == -1:
+            return full
+        intro: str  = full[: nl2 + 2]
+        rest:  str  = full[nl2 + 2:]
+
+        kept: list[str] = []
+        for sub in _SUB_RE.finditer(rest):
+            rel: str = sub.group("rel").strip()
+            # Try to find the absolute path in gone_set.
+            gone: bool = False
+            for g in gone_set:
+                if g.endswith(os.sep + rel) or g.endswith("/" + rel) or Path(g).name == rel:
+                    gone = True
+                    break
+            if not gone:
+                kept.append(sub.group(0))
+
+        if not kept:
+            return ""  # all files gone — drop the whole block
+
+        # Update the count in the header.
+        new_intro: str = re.sub(
+            r"Here are all \d+ file\(s\)",
+            f"Here are all {len(kept)} file(s)",
+            intro,
+        )
+        return new_intro + "\n\n".join(kept)
+
+    # Apply the bulk-block fix only to matching regions.
+    content = re.sub(
+        r"Here are all \d+ file\(s\) from `[^`]+`:\n\n(?:### [^\n]+\n```[^\n]*\n.*?```\n?)+",
+        _fix_bulk,
+        content,
+        flags=re.DOTALL,
+    )
+
+    return content.strip()
+
+
+def handle_refresh(messages: list[dict], state: dict) -> None:
+    """Reload tracked files, update context, and prune references to deleted files."""
+    cwd: str = state["cwd"]
+
+    # ---- 1. Collect all tracked files under cwd --------------------------
+    tracked: list[str] = _all_tracked_files()
+    local: list[str]   = [fp for fp in tracked if fp.startswith(cwd)]
+
+    if not local:
+        console.print("[info]No tracked files under current directory. Use /read to load files.[/info]")
+        return
+
+    refreshed: list[tuple[str, str]] = []  # (abs_path, new_content)
+    unchanged: list[str]             = []
+    gone: list[str]                  = []
+
+    for fp in local:
+        if not Path(fp).exists():
+            gone.append(fp)
+            continue
+        try:
+            new_content: str = Path(fp).read_text(encoding="utf-8")
+        except Exception:
+            gone.append(fp)
+            continue
+
+        # Compare with HEAD snapshot to decide changed/unchanged.
+        old_content: str = ""
+        idx: dict = _load_vc(fp)
+        head_id: str | None = idx.get("head")
+        if head_id and head_id in idx["commits"]:
+            try:
+                old_content = Path(idx["commits"][head_id]["snapshot"]).read_text(encoding="utf-8")
+            except Exception:
+                pass
+
+        if new_content != old_content:
+            refreshed.append((fp, new_content))
+        else:
+            unchanged.append(fp)
+
+    gone_set: set[str] = set(gone)
+
+    # ---- 2. Prune stale messages that reference gone files ----------------
+    pruned: int = 0
+    new_messages: list[dict] = []
+    for msg in messages:
+        if msg["role"] not in ("user", "assistant"):
+            new_messages.append(msg)
+            continue
+        original: str = msg["content"]
+        cleaned: str  = _strip_file_blocks(original, gone_set) if gone else original
+        if not cleaned.strip():
+            # Message is now empty — drop it entirely.
+            pruned += 1
+            continue
+        if cleaned != original:
+            pruned += 1
+            new_messages.append({**msg, "content": cleaned})
+        else:
+            new_messages.append(msg)
+    messages[:] = new_messages
+
+    # ---- 3. Prune pending_context ----------------------------------------
+    new_pending: list[str] = []
+    for ctx in state.get("pending_context", []):
+        cleaned_ctx: str = _strip_file_blocks(ctx, gone_set) if gone else ctx
+        if cleaned_ctx.strip():
+            new_pending.append(cleaned_ctx)
+    state["pending_context"] = new_pending
+
+    # ---- 4. Re-inject updated file content into pending_context ----------
+    for fp, content in refreshed:
+        state.setdefault("pending_context", []).append(
+            f"Here is the content of `{fp}`:\n\n```\n{content}\n```"
+        )
+        # Also commit the refreshed snapshot to VC.
+        _vc_commit(fp, content, "Refresh snapshot")
+
+    # ---- 5. Report -------------------------------------------------------
+    report_lines: list[str] = []
+
+    if refreshed:
+        report_lines.append("[bold green]Updated[/bold green] (reloaded into context):")
+        for fp, _ in refreshed:
+            report_lines.append(f"  [green]+[/green] {fp}")
+
+    if unchanged:
+        report_lines.append("[bold]Unchanged[/bold] (no disk changes):")
+        for fp in unchanged:
+            report_lines.append(f"  [dim]\u2013[/dim] {fp}")
+
+    if gone:
+        report_lines.append("[bold red]Gone[/bold red] (removed from context):")
+        for fp in gone:
+            report_lines.append(f"  [red]\u00d7[/red] {fp}")
+
+    if pruned:
+        report_lines.append(f"\n[dim]Removed {pruned} stale message(s) / context block(s).[/dim]")
+
+    if not report_lines:
+        report_lines.append("[info]Everything is up to date.[/info]")
+
+    console.print(Panel(
+        "\n".join(report_lines),
+        title="/refresh",
+        border_style=SAKURA_DEEP,
+    ))
+
+
+# ---------------------------------------------------------------------------
 # General helpers
 # ---------------------------------------------------------------------------
 
@@ -924,7 +1124,7 @@ def apply_command_runs(reply: str, cwd: str, messages: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 _SLASH_COMMANDS: list[str] = [
-    "/cd", "/read", "/run", "/undo", "/redo", "/files",
+    "/cd", "/read", "/refresh", "/run", "/undo", "/redo", "/files",
     "/clear", "/check", "/stackview", "/settings", "/history", "/help",
     "/commit", "/log", "/checkout",
     "/quit", "/exit", "/q",
@@ -1587,6 +1787,10 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
             )
             console.print(f"[info]Loaded {resolved} into context.[/info]")
 
+    elif name == "/refresh":
+        handle_refresh(messages, state)
+        save_session(cwd, messages)
+
     elif name == "/run":
         if not arg:
             console.print("[error]Usage: /run <shell command>[/error]")
@@ -1796,36 +2000,27 @@ def _raw_stream(
     Returns (full_text, total_physical_rows_on_screen).
     """
     full: str          = ""
-    window: list[str]  = []   # logical lines in the visible window
-    partial: str       = ""   # current incomplete line
-    # physical rows currently on screen:
-    #   rendered_rows = sum(_phys(l) for l in window) + partial_phys
+    window: list[str]  = []
+    partial: str       = ""
     rendered_rows: int  = 0
-    partial_phys: int   = 0   # physical rows used by the current partial line
+    partial_phys: int   = 0
 
     def _tw() -> int:
-        """Terminal width, never 0."""
         return max(1, console.width or 80)
 
     def _phys(text: str) -> int:
         return _phys_rows(text, _tw())
 
     def _redraw() -> None:
-        """Redraw the entire window + partial, using physical-row tracking."""
         nonlocal rendered_rows, partial_phys
-        # Move cursor back to the very top of our window area.
-        # Cursor is at the END of the partial line which is at physical row
-        # (rendered_rows - 1) from the top.  So go up (rendered_rows - 1) rows.
         if rendered_rows > 1:
             sys.stdout.write(f"\033[{rendered_rows - 1}A")
         sys.stdout.write("\r")
-        # Erase everything from here to the end of the screen, then redraw.
         sys.stdout.write("\033[J")
         for line in window:
             sys.stdout.write(line + "\n")
         sys.stdout.write(partial)
         sys.stdout.flush()
-        # Recalculate physical rows.
         partial_phys  = _phys(partial)
         rendered_rows = sum(_phys(l) for l in window) + partial_phys
 
@@ -1837,7 +2032,6 @@ def _raw_stream(
             full += token
 
             if "\n" in token:
-                # ---- newline(s) in this token --------------------------------
                 parts: list[str] = token.split("\n")
                 partial += parts[0]
                 window.append(partial)
@@ -1850,22 +2044,17 @@ def _raw_stream(
                 partial = parts[-1]
                 _redraw()
             else:
-                # ---- no newline: extend partial line in-place ----------------
                 new_partial: str  = partial + token
                 new_phys: int     = _phys(new_partial)
 
                 if rendered_rows == 0:
-                    # Very first token — just write it.
                     sys.stdout.write(new_partial)
                     sys.stdout.flush()
                     partial_phys  = new_phys
                     rendered_rows = new_phys
                 else:
-                    # Move up to the start of the current partial (it may span
-                    # multiple physical rows if it previously wrapped).
                     if partial_phys > 1:
                         sys.stdout.write(f"\033[{partial_phys - 1}A")
-                    # Erase from here to end-of-screen and rewrite the partial.
                     sys.stdout.write("\r\033[J" + new_partial)
                     sys.stdout.flush()
                     rendered_rows = rendered_rows - partial_phys + new_phys
