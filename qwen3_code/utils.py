@@ -20,6 +20,16 @@ SESSION_DIR: Path = Path.home() / ".local" / "share" / "qwen3-code" / "sessions"
 STREAM_MAX_LINES: int        = 10
 SIZE_REDUCTION_THRESHOLD: float = 0.20
 
+# Directories skipped during /read -a  (content not read, but their presence
+# is noted in the context so the AI knows they exist).
+IGNORED_DIRS: set[str] = {
+    ".venv", "venv", ".env", "env",
+    "node_modules", "__pycache__", ".git", ".hg", ".svn",
+    "dist", "build", ".next", ".nuxt", ".tox",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    "coverage", ".eggs",
+}
+
 SYSTEM_PROMPT: str = textwrap.dedent("""\
     You are an expert software engineer assistant embedded in a terminal.
     You help the user understand, write, debug, and refactor code.
@@ -84,14 +94,54 @@ def read_file(path: str) -> str:
         return f"[could not read file: {exc}]"
 
 
-def run_command(cmd: str) -> str:
+def run_command(cmd: str, cwd: str = "") -> str:
+    """Run a shell command silently. Returns full output string."""
     try:
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True, timeout=30,
+            cwd=cwd or None,
+        )
         return (result.stdout + result.stderr).strip() or "(no output)"
     except subprocess.TimeoutExpired:
         return "[command timed out after 30 s]"
     except Exception as exc:
         return f"[command error: {exc}]"
+
+
+def run_command_live(cmd: str, cwd: str = "") -> str:
+    """Run a shell command, streaming each line to stdout as it arrives.
+    Returns the full output as a string for injecting back into the conversation."""
+    from qwen3_code.theme import console, SAKURA, SAKURA_DARK, SAKURA_MUTED
+    from rich.panel import Panel
+
+    lines: list[str] = []
+    console.print(Panel(
+        f"[bold]$ {cmd}[/bold]",
+        title="Running", border_style=SAKURA_MUTED,
+    ))
+    try:
+        proc = subprocess.Popen(
+            cmd, shell=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+            cwd=cwd or None,
+        )
+        assert proc.stdout is not None
+        for raw_line in proc.stdout:
+            sys.stdout.write(raw_line)
+            sys.stdout.flush()
+            lines.append(raw_line)
+        proc.wait()
+        rc: int = proc.returncode
+    except Exception as exc:
+        err = f"[command error: {exc}]"
+        console.print(f"[error]{err}[/error]")
+        return err
+
+    output: str  = "".join(lines).strip() or "(no output)"
+    status_color = SAKURA if rc == 0 else SAKURA_DARK
+    console.print(f"[{status_color}]{'\u2713 done' if rc == 0 else f'exit {rc}'}[/{status_color}]")
+    return output
 
 
 def build_context_snippet(cwd: str) -> str:

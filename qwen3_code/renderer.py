@@ -128,23 +128,10 @@ def _raw_stream(
             token = chunk["message"]["content"]
             full += token
             if "\n" in token:
-                parts = token.split("\n")
-                partial += parts[0]
-                for p in [partial] + parts[1:-1]:
-                    window.append(p if p != partial else partial)
-                    if p == partial:
-                        pass
-                    if len(window) > STREAM_MAX_LINES:
-                        window = window[-STREAM_MAX_LINES:]
-                # rebuild properly
-                window.clear()
-                all_lines = (partial + token[len(parts[0]):]).split("\n") if False else []
-                # simpler rebuild:
-                rebuilt = (partial.rstrip(parts[0] if partial.endswith(parts[0]) else ""))
-                # Just do it correctly:
-                before_split = partial  # what we had before this token
+                before_split = partial
                 combined     = before_split + token
                 all_new      = combined.split("\n")
+                window.clear()
                 for line in all_new[:-1]:
                     window.append(line)
                     if len(window) > STREAM_MAX_LINES:
@@ -175,6 +162,12 @@ def _raw_stream(
 
 
 def stream_response(messages: list[dict], cwd: str = "") -> str:
+    """Stream a response from the model.
+
+    Ctrl+D at any point (initial stream OR partial-write retry) sets the
+    cancel flag.  When cancelled, the partial text is rendered for the user
+    but NO files are written and NO commands are run.
+    """
     cancel_event = threading.Event()
     console.print()
     console.print(_status_line("thinking...", "ctrl+d to cancel"))
@@ -212,11 +205,19 @@ def stream_response(messages: list[dict], cwd: str = "") -> str:
         rw.start()
         rr, rw_rows = _raw_stream(messages, rc)
         rc_cancelled = rc.is_set()
-        rc.set(); rw.join(timeout=0.5)
+        rc.set()
+        rw.join(timeout=0.5)
         sys.stdout.write(f"\033[{max(2, rw_rows + 1)}A\r\033[J")
         sys.stdout.flush()
-        messages.pop(); messages.pop()
-        if rr and not rc_cancelled:
+        messages.pop()
+        messages.pop()
+
+        if rc_cancelled:
+            console.print("[info]Cancelled \u2014 partial response shown, no files written.[/info]")
+            render_response(rr or full_reply)
+            return rr or full_reply
+
+        if rr:
             full_reply = rr
 
     render_response(full_reply)

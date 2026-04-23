@@ -1,11 +1,12 @@
 """Partial-write detection, file-write application, and RUN-marker handling."""
 
 import re
+import sys
 
 from rich.panel import Panel
 
 from qwen3_code.theme import console, SAKURA_DEEP, SAKURA_DARK, SAKURA_MUTED
-from qwen3_code.utils import run_command
+from qwen3_code.utils import run_command_live
 from qwen3_code.vc import write_file_with_vc
 
 # ---------------------------------------------------------------------------
@@ -48,6 +49,7 @@ def apply_file_writes(reply: str) -> None:
 
 
 def apply_command_runs(reply: str, cwd: str, messages: list[dict]) -> None:
+    """Apply <!-- RUN: cmd --> markers, streaming output live."""
     for m in _RUN_PATTERN.finditer(reply):
         cmd = m.group("cmd").strip()
         if not cmd:
@@ -65,6 +67,5 @@ def apply_command_runs(reply: str, cwd: str, messages: list[dict]) -> None:
             console.print("[info]Command skipped.[/info]")
             messages.append({"role": "user", "content": f"[Command `{cmd}` was denied.]"})
             continue
-        output = run_command(cmd)
-        console.print(Panel(output, title=f"$ {cmd}", border_style=SAKURA_MUTED))
+        output = run_command_live(cmd, cwd)
         messages.append({"role": "user", "content": f"[Command `{cmd}` output:]\n```\n{output}\n```"})
