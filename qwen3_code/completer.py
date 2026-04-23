@@ -27,7 +27,7 @@ SLASH_COMMANDS: list[str] = [
 ]
 
 CMD_SUBARGS: dict[str, list[str]] = {
-    "/stackview": ["fh", "fhf", "sessions", "sess", "env", "environment", "help"],
+    "/stackview": ["fh", "fhf", "sessions", "sess", "env", "environment", "tree", "help"],
     "/check":     ["ALL"],
     "/read":      ["-a"],
     "/settings":  list(DEFAULT_SETTINGS.keys()),

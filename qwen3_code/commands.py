@@ -65,7 +65,7 @@ def _help_table() -> Table:
         ("/plan <task>",          f"AI plans then auto-executes a task"),
         ("/clear",                "clear conversation history"),
         ("/check <target>",       f"AI code review  {D}ALL | file | file:func{E}"),
-        ("/stackview <type>",     f"inspect state  {D}fh / fhf / sessions / env{E}"),
+        ("/stackview <type>",     f"inspect state  {D}fh / fhf / sessions / env / tree{E}"),
         ("/settings [key val]",   f"view/edit settings  {D}(saved to settings.json){E}"),
         ("/history",              "show message history"),
         ("/help",                 "show this help"),
@@ -258,8 +258,7 @@ def handle_plan(task: str, messages: list[dict], state: dict) -> None:
     plan_prompt = (
         f"Create a concise numbered step-by-step plan for the following task. "
         f"Be specific about which files to create or edit and which commands to run. "
-        f"Output the plan only \u2014 do NOT start implementing yet.\n\n"
-        f"Task: {task}"
+        f"Output the plan only \u2014 do NOT start implementing yet.\n\nTask: {task}"
     )
     messages.append({"role": "user", "content": plan_prompt})
     console.print(Panel(f"[bold]Planning:[/bold] {task}", title="/plan", border_style=SAKURA_MUTED))
@@ -395,6 +394,7 @@ _SV_TYPES = {
     "fhf":      "File history full (all projects)",
     "sessions": "Saved sessions",
     "env":      "Runtime environment info",
+    "tree":     "Project tree with AI descriptions",
 }
 
 
@@ -464,12 +464,24 @@ def _sv_env(cwd: str, messages: list[dict]) -> None:
     console.print(Panel("\n".join(rows), title="Environment", border_style=SAKURA_DEEP))
 
 
+def _sv_tree(cwd: str) -> None:
+    file_list = _collect_files_for_tree(cwd, include_ignored=False)
+    if not file_list:
+        console.print("[info]No files found.[/info]")
+        return
+    console.print(f"[dim]Generating AI descriptions for {len(file_list[:40])} file(s)\u2026[/dim]")
+    descriptions = _generate_file_descriptions_streamed(file_list)
+    tree = _build_rich_tree(cwd, include_ignored=False, descriptions=descriptions)
+    console.print(Panel(tree, title=f"Tree + AI descriptions [{_short_cwd(cwd)}]", border_style=SAKURA_DEEP))
+
+
 def handle_stackview(sv_type: str, cwd: str, messages: list[dict]) -> None:
     t = sv_type.strip().lower()
     if t == "fh":                     _sv_fh(cwd)
     elif t == "fhf":                  _sv_fhf()
     elif t in ("sessions", "sess"):   _sv_sessions()
     elif t in ("env", "environment"): _sv_env(cwd, messages)
+    elif t == "tree":                 _sv_tree(cwd)
     elif t in ("", "help"):
         rows = [f"  {k:<12}  {v}" for k, v in _SV_TYPES.items()]
         console.print(Panel("\n".join(rows), title="/stackview types", border_style=SAKURA_DEEP))

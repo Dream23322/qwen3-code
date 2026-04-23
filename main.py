@@ -18,6 +18,7 @@ Package layout
     completer.py  - fuzzy hint completions and raw-mode inline prompt
     renderer.py   - streaming response renderer (ollama chat loop)
     commands.py   - all /slash command handlers and dispatcher
+    context_tools.py - /context subcommands and usage bar
 """
 
 import os
@@ -27,7 +28,7 @@ from pathlib import Path
 from qwen3_code.theme import console, SAKURA, SAKURA_DEEP
 from qwen3_code.settings import _model, _app_name, CFG
 from qwen3_code.utils import VC_DIR, SESSION_DIR, build_context_snippet, _short_cwd
-from qwen3_code.session import load_session, save_session
+from qwen3_code.session import load_session, save_session, load_last_cwd
 from qwen3_code.completer import inline_prompt, enable_windows_vt
 from qwen3_code.commands import handle_slash_command
 from qwen3_code.renderer import stream_response
@@ -41,12 +42,23 @@ def main() -> None:
     args = parser.parse_args()
 
     raw_dir = args.dir or args.dir_flag
+
     if raw_dir is not None:
+        # Explicit directory provided on the command line
         target = Path(raw_dir).expanduser().resolve()
         if not target.is_dir():
             print(f"[error] Not a directory: {raw_dir}")
             sys.exit(1)
         os.chdir(target)
+    elif CFG.get("open_from_last_session", True):
+        # No explicit dir — try to restore the last used directory
+        last = load_last_cwd()
+        if last and last != os.getcwd():
+            try:
+                os.chdir(last)
+                console.print(f"[dim]Restored last directory: {last}[/dim]")
+            except Exception:
+                pass  # last dir vanished; stay where we are
 
     enable_windows_vt()
     VC_DIR.mkdir(parents=True, exist_ok=True)
