@@ -71,6 +71,23 @@ SYSTEM_PROMPT: str = textwrap.dedent("""\
 
     Always provide the COMPLETE file from top to bottom. The tool will back up
     the original so the user can /undo at any time.
+
+    ============================================================
+    REQUESTING FILES
+    ============================================================
+    If you need to read a file that hasn't been provided yet, emit:
+
+        <!-- READ: path/to/file -->
+
+    You may emit multiple READ markers in one response. The tool will read
+    each file and provide the contents automatically, then reprompt you to
+    continue. Do NOT guess or make up file contents — if you need a file,
+    request it with a READ marker.
+
+    Example — asking for two files before answering:
+
+        <!-- READ: src/main.py -->
+        <!-- READ: src/utils.py -->
 """).strip()
 
 PARTIAL_REPROMPT: str = (

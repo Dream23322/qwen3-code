@@ -1,6 +1,7 @@
-"""Partial-write detection, file-write application, and RUN-marker handling."""
+"""Partial-write detection, file-write application, RUN-marker handling, and READ-request handling."""
 
 import re
+from pathlib import Path
 
 from rich.panel import Panel
 
@@ -33,6 +34,35 @@ _WRITE_PATTERN: re.Pattern = re.compile(
 
 _RUN_PATTERN: re.Pattern = re.compile(r"<!--\s*RUN:\s*(?P<cmd>[^>]+?)\s*-->", re.DOTALL)
 
+# ---------------------------------------------------------------------------
+# READ request markers  (AI → tool)
+# ---------------------------------------------------------------------------
+
+_READ_REQUEST_RE: re.Pattern = re.compile(
+    r"<!--\s*READ:\s*(?P<path>[^\s>]+)\s*-->"
+)
+
+
+def has_read_requests(reply: str) -> bool:
+    """Return True if the reply contains at least one <!-- READ: path --> marker."""
+    return bool(_READ_REQUEST_RE.search(reply))
+
+
+def collect_read_requests(reply: str) -> list[str]:
+    """Return deduplicated list of paths from <!-- READ: path --> markers."""
+    seen: set[str] = set()
+    paths: list[str] = []
+    for m in _READ_REQUEST_RE.finditer(reply):
+        p = m.group("path").strip()
+        if p not in seen:
+            seen.add(p)
+            paths.append(p)
+    return paths
+
+
+# ---------------------------------------------------------------------------
+# Partial-write helpers
+# ---------------------------------------------------------------------------
 
 def reply_has_partial_write(reply: str) -> bool:
     for m in _WRITE_PATTERN.finditer(reply):

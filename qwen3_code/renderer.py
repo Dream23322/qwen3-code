@@ -5,6 +5,7 @@ import re
 import sys
 import threading
 import time
+from pathlib import Path
 
 import ollama
 from rich.markdown import Markdown
@@ -14,8 +15,11 @@ from rich.text import Text
 
 from qwen3_code.theme import console, SAKURA, SAKURA_DEEP, SAKURA_DARK, SAKURA_MUTED
 from qwen3_code.settings import _model, _assistant_name
-from qwen3_code.utils import _phys_rows, STREAM_MAX_LINES, PARTIAL_REPROMPT
-from qwen3_code.partial import reply_has_partial_write, apply_file_writes, apply_command_runs
+from qwen3_code.utils import _phys_rows, STREAM_MAX_LINES, PARTIAL_REPROMPT, resolve_path, read_file
+from qwen3_code.partial import (
+    reply_has_partial_write, apply_file_writes, apply_command_runs,
+    has_read_requests, collect_read_requests,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +87,9 @@ def render_response(text: str) -> None:
             console.print(Panel(Syntax(code, lang, theme="dracula", line_numbers=True),
                                 title=title, border_style=border))
         else:
-            cleaned = re.sub(r"<!--\s*WRITE:[^>]+-->", "", part).strip()
+            cleaned = re.sub(r"<!--\s*WRITE:[^>]+-->", "", part)
+            cleaned = re.sub(r"<!--\s*READ:[^>]+-->", "", cleaned)
+            cleaned = re.sub(r"<!--\s*RUN:[^>]+-->", "", cleaned).strip()
             if cleaned:
                 console.print(Markdown(cleaned))
 
@@ -161,27 +167,34 @@ def _raw_stream(
     return full, rendered_rows
 
 
+def _do_stream(
+    messages: list[dict],
+    status_label: str = "thinking...",
+) -> tuple[str, bool]:
+    """Run one stream+cancel-watcher cycle. Returns (reply, was_cancelled)."""
+    cancel_event = threading.Event()
+    console.print()
+    console.print(_status_line(status_label, "ctrl+d to cancel"))
+    watcher = threading.Thread(target=_watch_for_cancel, args=(cancel_event,), daemon=True)
+    watcher.start()
+    reply, rows = _raw_stream(messages, cancel_event)
+    cancelled = cancel_event.is_set()
+    cancel_event.set()
+    watcher.join(timeout=0.5)
+    sys.stdout.write(f"\033[{max(2, rows + 1)}A\r\033[J")
+    sys.stdout.flush()
+    return reply, cancelled
+
+
 def stream_response(messages: list[dict], cwd: str = "") -> str:
     """Stream a response from the model.
 
-    Ctrl+D at any point (initial stream OR partial-write retry) sets the
-    cancel flag.  When cancelled, the partial text is rendered for the user
-    but NO files are written and NO commands are run.
+    Handles:
+    - Ctrl+D cancel at any point
+    - Partial-write detection and reprompt
+    - <!-- READ: path --> markers: auto-reads requested files and reprompts
     """
-    cancel_event = threading.Event()
-    console.print()
-    console.print(_status_line("thinking...", "ctrl+d to cancel"))
-
-    watcher = threading.Thread(target=_watch_for_cancel, args=(cancel_event,), daemon=True)
-    watcher.start()
-    full_reply, window_rows = _raw_stream(messages, cancel_event)
-
-    user_cancelled = cancel_event.is_set()
-    cancel_event.set()
-    watcher.join(timeout=0.5)
-
-    sys.stdout.write(f"\033[{max(2, window_rows + 1)}A\r\033[J")
-    sys.stdout.flush()
+    full_reply, user_cancelled = _do_stream(messages)
 
     if not full_reply:
         if user_cancelled:
@@ -193,33 +206,61 @@ def stream_response(messages: list[dict], cwd: str = "") -> str:
         render_response(full_reply)
         return full_reply
 
+    # ---- Partial-write reprompt ------------------------------------------
     if reply_has_partial_write(full_reply):
         console.print(Panel("[info]Partial file detected. Reprompting...[/info]",
                             title="Partial write", border_style=SAKURA_DARK))
         messages.append({"role": "assistant", "content": full_reply})
         messages.append({"role": "user",      "content": PARTIAL_REPROMPT})
-        rc = threading.Event()
-        console.print()
-        console.print(_status_line("retrying...", "ctrl+d to cancel"))
-        rw = threading.Thread(target=_watch_for_cancel, args=(rc,), daemon=True)
-        rw.start()
-        rr, rw_rows = _raw_stream(messages, rc)
-        rc_cancelled = rc.is_set()
-        rc.set()
-        rw.join(timeout=0.5)
-        sys.stdout.write(f"\033[{max(2, rw_rows + 1)}A\r\033[J")
-        sys.stdout.flush()
+        rr, rc_cancelled = _do_stream(messages, "retrying...")
         messages.pop()
         messages.pop()
-
         if rc_cancelled:
             console.print("[info]Cancelled \u2014 partial response shown, no files written.[/info]")
             render_response(rr or full_reply)
             return rr or full_reply
-
         if rr:
             full_reply = rr
 
+    # ---- READ request loop -----------------------------------------------
+    # The AI can emit <!-- READ: path --> to request file contents.
+    # We honour up to 3 rounds to avoid infinite loops.
+    _MAX_READ_ROUNDS = 3
+    for _rnd in range(_MAX_READ_ROUNDS):
+        if not has_read_requests(full_reply):
+            break
+        req_paths = collect_read_requests(full_reply)
+        file_blocks: list[str] = []
+        for rp in req_paths:
+            resolved = resolve_path(rp, cwd) if cwd else rp
+            content  = read_file(resolved)
+            file_blocks.append(
+                f"Here is the content of `{resolved}`:\n\n```\n{content}\n```"
+            )
+        if not file_blocks:
+            break
+        names = ", ".join(Path(p).name for p in req_paths)
+        console.print(Panel(
+            f"[info]AI requested {len(file_blocks)} file(s): [bold]{names}[/bold]\nLoading and reprompting\u2026[/info]",
+            title="File read request", border_style=SAKURA_DEEP,
+        ))
+        messages.append({"role": "assistant", "content": full_reply})
+        messages.append({
+            "role": "user",
+            "content": "Files you requested:\n\n" + "\n\n".join(file_blocks),
+        })
+        new_reply, was_cancelled = _do_stream(messages, "reading files...")
+        if was_cancelled or not new_reply:
+            if was_cancelled:
+                console.print("[info]Cancelled.[/info]")
+            # Roll back the messages we added so the loop state is consistent
+            messages.pop()
+            messages.pop()
+            break
+        # Keep the READ context in messages — useful for follow-ups
+        full_reply = new_reply
+
+    # ---- Final render + apply --------------------------------------------
     render_response(full_reply)
     apply_file_writes(full_reply)
     apply_command_runs(full_reply, cwd, messages)

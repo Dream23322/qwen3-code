@@ -21,6 +21,7 @@ SLASH_COMMANDS: list[str] = [
     "/cd", "/read", "/refresh", "/run", "/undo", "/redo", "/files",
     "/clear", "/check", "/stackview", "/settings", "/history", "/help",
     "/commit", "/log", "/checkout",
+    "/tree", "/loadtree", "/plan",
     "/quit", "/exit", "/q",
 ]
 
@@ -29,6 +30,8 @@ CMD_SUBARGS: dict[str, list[str]] = {
     "/check":     ["ALL"],
     "/read":      ["-a"],
     "/settings":  list(DEFAULT_SETTINGS.keys()),
+    "/tree":      ["-i"],
+    "/loadtree":  ["-i", "-d", "-i -d", "-d -i"],
 }
 
 FILE_COMMANDS: set[str] = {"/read", "/check", "/undo", "/redo", "/files",
