@@ -1,12 +1,11 @@
 """Partial-write detection, file-write application, and RUN-marker handling."""
 
 import re
-import sys
 
 from rich.panel import Panel
 
 from qwen3_code.theme import console, SAKURA_DEEP, SAKURA_DARK, SAKURA_MUTED
-from qwen3_code.utils import run_command_live
+from qwen3_code.utils import ConsoleSession
 from qwen3_code.vc import write_file_with_vc
 
 # ---------------------------------------------------------------------------
@@ -49,8 +48,18 @@ def apply_file_writes(reply: str) -> None:
 
 
 def apply_command_runs(reply: str, cwd: str, messages: list[dict]) -> None:
-    """Apply <!-- RUN: cmd --> markers, streaming output live."""
-    for m in _RUN_PATTERN.finditer(reply):
+    """Process <!-- RUN: cmd --> markers with a shared split-screen console session.
+
+    All approved commands in a single AI response share one ConsoleSession so
+    the right-side history panel accumulates across the whole sequence.
+    """
+    matches = list(_RUN_PATTERN.finditer(reply))
+    if not matches:
+        return
+
+    session = ConsoleSession()
+
+    for m in matches:
         cmd = m.group("cmd").strip()
         if not cmd:
             continue
@@ -67,5 +76,8 @@ def apply_command_runs(reply: str, cwd: str, messages: list[dict]) -> None:
             console.print("[info]Command skipped.[/info]")
             messages.append({"role": "user", "content": f"[Command `{cmd}` was denied.]"})
             continue
-        output = run_command_live(cmd, cwd)
+        output = session.run(cmd, cwd)
         messages.append({"role": "user", "content": f"[Command `{cmd}` output:]\n```\n{output}\n```"})
+
+    # Print a final summary panel when multiple commands were run
+    session.print_summary()
