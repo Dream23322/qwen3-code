@@ -8,9 +8,11 @@ from rich.markup import escape as _esc
 
 from qwen3_code.theme import console, SAKURA, SAKURA_DEEP, SAKURA_DARK, SAKURA_MUTED
 
-# Estimated context window in tokens (rough: 1 token ≈ 4 chars).
-# Matches qwen3's default 128 k context.
-_CTX_LIMIT_TOKENS: int = 128_000
+
+def _ctx_limit() -> int:
+    """Read context_window from live settings (falls back to 128k)."""
+    from qwen3_code.settings import _context_window
+    return _context_window()
 
 
 # ---------------------------------------------------------------------------
@@ -19,13 +21,13 @@ _CTX_LIMIT_TOKENS: int = 128_000
 
 def ctx_usage_bar(
     messages: list[dict],
-    limit: int = _CTX_LIMIT_TOKENS,
     bar_width: int = 38,
 ) -> str:
     """Return a Rich-markup string with a coloured usage bar.
 
-    Example:  [green][=========------------------------------][/green]  [green]~12.3k/128k tokens[/green]
+    Example:  [green][=========------------------------------][/green]  ~12.3k/128k tokens
     """
+    limit       = _ctx_limit()
     total_chars = sum(len(m.get("content") or "") for m in messages)
     est_tokens  = max(0, total_chars // 4)
     pct         = min(1.0, est_tokens / limit)
@@ -39,7 +41,7 @@ def ctx_usage_bar(
     else:            colour = "red"
 
     used_str  = f"{est_tokens / 1000:.1f}k"
-    limit_str = f"{limit // 1000}k"
+    limit_str = f"{limit / 1000:.0f}k"
     return (
         f"[{colour}][[/{colour}][{colour}]{bar}[/{colour}][{colour}]][/{colour}]"
         f"  [{colour}]~{used_str}/{limit_str} tokens[/{colour}]"
@@ -51,11 +53,13 @@ def ctx_usage_bar(
 # ---------------------------------------------------------------------------
 
 def ctx_display(messages: list[dict]) -> None:
-    non_system = [(i, m) for i, m in enumerate(messages) if m["role"] != "system"]
+    non_system  = [(i, m) for i, m in enumerate(messages) if m["role"] != "system"]
     total_chars = sum(len(m.get("content") or "") for m in messages)
     est_tokens  = max(0, total_chars // 4)
+    limit       = _ctx_limit()
 
     lines: list[str] = [ctx_usage_bar(messages)]
+    lines.append(f"[dim]  Change limit: /settings context_window <tokens>  (current: {limit:,})[/dim]")
     lines.append("")
 
     if not non_system:
@@ -105,10 +109,8 @@ def ctx_clean(messages: list[dict], state: dict) -> None:
         console.print("[info]Not enough messages to clean (need at least 4).[/info]")
         return
 
-    # Show current state first
     ctx_display(messages)
 
-    # Build numbered summary for the AI
     summary: list[str] = []
     for i, m in non_system:
         chars   = len(m.get("content") or "")
@@ -146,7 +148,6 @@ def ctx_clean(messages: list[dict], state: dict) -> None:
         console.print(f"[error]Model error: {exc}[/error]")
         return
 
-    # Extract JSON array (may be embedded in prose)
     mat = re.search(r"\[[\d,\s]*\]", raw)
     if not mat:
         console.print(f"[error]Could not parse AI response: {_esc(raw[:200])}[/error]")
@@ -158,9 +159,7 @@ def ctx_clean(messages: list[dict], state: dict) -> None:
         console.print("[error]Invalid JSON from AI.[/error]")
         return
 
-    # Guard: only allow non-system indices
-    valid = {i for i, _ in non_system}
-    # Never remove the last 6 non-system messages
+    valid    = {i for i, _ in non_system}
     last_six = {i for i, _ in non_system[-6:]}
     indices  = indices & valid - last_six
 
@@ -168,15 +167,14 @@ def ctx_clean(messages: list[dict], state: dict) -> None:
         console.print("[info]AI found nothing to remove \u2014 context looks clean.[/info]")
         return
 
-    # Show preview
     preview_lines = ["[bold]AI suggests removing:[/bold]"]
     saved_tokens  = 0
     for idx in sorted(indices):
-        m_obj   = messages[idx]
-        chars   = len(m_obj.get("content") or "")
-        toks    = chars // 4
+        m_obj        = messages[idx]
+        chars        = len(m_obj.get("content") or "")
+        toks         = chars // 4
         saved_tokens += toks
-        prev    = (m_obj.get("content") or "").replace("\n", " ")[:80]
+        prev         = (m_obj.get("content") or "").replace("\n", " ")[:80]
         preview_lines.append(
             f"  [dim][{idx}] {m_obj['role']} (~{toks}t): {_esc(prev)}\u2026[/dim]"
         )

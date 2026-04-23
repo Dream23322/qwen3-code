@@ -14,13 +14,15 @@ DEFAULT_SETTINGS: dict = {
     "assistant_name":         "assistant",
     "model":                  "huihui_ai/qwen3-coder-abliterated:30b",
     "open_from_last_session": True,
+    "context_window":         128000,
 }
 
 SETTINGS_HELP: dict[str, str] = {
     "app_name":               "Display name shown in the header and panels",
     "assistant_name":         "Label used when the AI is thinking / responding",
     "model":                  "Ollama model tag to use for all inference",
-    "open_from_last_session": "true/false  \u2014 resume previous conversation on startup",
+    "open_from_last_session": "true/false  — resume previous conversation on startup",
+    "context_window":         "Token limit for your model (e.g. 128000, 1000000) — used by /context bar",
 }
 
 
@@ -52,6 +54,7 @@ CFG: dict = load_settings()
 def _model()          -> str:  return CFG["model"]
 def _app_name()       -> str:  return CFG["app_name"]
 def _assistant_name() -> str:  return CFG["assistant_name"]
+def _context_window() -> int:  return int(CFG.get("context_window", 128_000))
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +107,6 @@ def handle_settings(arg: str) -> None:
     old = CFG[key]
     CFG[key] = value
     save_settings(CFG)
-    console.print(f"[info][bold cyan]{key}[/bold cyan]: [dim]{old}[/dim] \u2192 [bold]{value}[/bold]  saved[/info]")
+    console.print(f"[info][bold cyan]{key}[/bold cyan]: [dim]{old}[/dim] → [bold]{value}[/bold]  saved[/info]")
     if key == "model":
         console.print(f"[info]Run: ollama pull {value}[/info]")
