@@ -24,6 +24,31 @@ from qwen3_code.refresh import handle_refresh
 from qwen3_code.renderer import stream_response
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _is_ignored_dir(entry: Path, include_ignored: bool) -> bool:
+    """Return True if *entry* (a directory) should be skipped.
+
+    Skips:
+    - Dot-directories (e.g. .git, .venv)
+    - Directories in IGNORED_DIRS by exact name
+    - Any directory that contains a pyvenv.cfg file (custom-named venvs like
+      pyqt_venv, myenv, .env312, etc.) — unless include_ignored is True.
+    """
+    if include_ignored:
+        return False
+    if entry.name.startswith("."):
+        return True
+    if entry.name in IGNORED_DIRS:
+        return True
+    # Custom-named venv: presence of pyvenv.cfg is the canonical marker
+    if (entry / "pyvenv.cfg").exists():
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # /help table
 # ---------------------------------------------------------------------------
 
@@ -69,7 +94,8 @@ def _help_table() -> Table:
 
 def _build_rich_tree(root: str, include_ignored: bool = False) -> RichTree:
     """Build a Rich Tree widget of the filesystem under *root*.
-    Tracked files are highlighted; ignored dirs are collapsed unless *include_ignored*.
+    Tracked files are highlighted; ignored dirs (including custom venvs) are
+    collapsed to a note unless *include_ignored* is True.
     """
     tracked = set(all_tracked_files())
 
@@ -80,22 +106,21 @@ def _build_rich_tree(root: str, include_ignored: bool = False) -> RichTree:
             return
         ignored_names: list[str] = []
         for entry in entries:
-            if not include_ignored:
-                if entry.name.startswith("."):
-                    continue
-                if entry.is_dir() and entry.name in IGNORED_DIRS:
-                    ignored_names.append(entry.name)
-                    continue
+            if entry.is_dir() and _is_ignored_dir(entry, include_ignored):
+                ignored_names.append(entry.name)
+                continue
             if entry.is_dir():
                 branch = node.add(f"[bold]{entry.name}/[/bold]")
                 _add_children(branch, entry)
             else:
+                if not include_ignored and entry.name.startswith("."):
+                    continue
                 is_tracked = str(entry.resolve()) in tracked
                 if is_tracked:
                     node.add(f"[{SAKURA}]{entry.name}[/{SAKURA}] [dim](tracked)[/dim]")
                 else:
                     node.add(f"[dim]{entry.name}[/dim]")
-        if ignored_names and not include_ignored:
+        if ignored_names:
             node.add(f"[dim italic]\u2026 {len(ignored_names)} ignored dir(s): {", ".join(ignored_names)}[/dim italic]")
 
     root_label = f"[bold]{Path(root).name}/[/bold]"
@@ -108,17 +133,15 @@ def _collect_files_for_tree(
     root: str,
     include_ignored: bool = False,
 ) -> list[tuple[str, str]]:  # [(rel_path, abs_path), ...]
-    """Walk *root* and return (rel_path, abs_path) for every file."""
+    """Walk *root* and return (rel_path, abs_path) for every non-ignored file."""
     results: list[tuple[str, str]] = []
     for rdir, dirs, fnames in os.walk(root):
         rpath = Path(rdir)
-        if not include_ignored:
-            dirs[:] = [
-                d for d in sorted(dirs)
-                if not d.startswith(".") and d not in IGNORED_DIRS
-            ]
-        else:
-            dirs[:] = sorted(dirs)
+        # Prune ignored dirs in-place so os.walk doesn't recurse into them
+        dirs[:] = [
+            d for d in sorted(dirs)
+            if not _is_ignored_dir(rpath / d, include_ignored)
+        ]
         for fname in sorted(fnames):
             if not include_ignored and fname.startswith("."):
                 continue
@@ -129,19 +152,15 @@ def _collect_files_for_tree(
 
 def _generate_file_descriptions(
     files: list[tuple[str, str]],  # [(rel_path, abs_path), ...]
-) -> dict[str, str]:               # rel_path → one-line description
-    """Ask the AI model to produce a one-line description for each file.
-    Returns a best-effort dict; entries may be missing if parsing fails.
-    """
+) -> dict[str, str]:               # rel_path -> one-line description
+    """Ask the AI model to produce a one-line description for each file."""
     import ollama
     from qwen3_code.settings import _model
 
     if not files:
         return {}
 
-    # Cap at 40 files to keep the prompt manageable
     subset = files[:40]
-
     snippets: list[str] = []
     for rel, absp in subset:
         try:
@@ -170,9 +189,8 @@ def _generate_file_descriptions(
         return {}
 
     result: dict[str, str] = {}
-    known_rels = {rel for rel, _ in subset}
+    known_rels  = {rel for rel, _ in subset}
     known_bases = {os.path.basename(rel): rel for rel, _ in subset}
-
     for line in raw.splitlines():
         line = line.strip().lstrip("-").strip()
         if ":" not in line:
@@ -182,12 +200,10 @@ def _generate_file_descriptions(
         desc = line[colon + 1:].strip()
         if not desc:
             continue
-        # Match by exact rel path or by basename
         if key in known_rels:
             result[key] = desc
         elif key in known_bases:
             result[known_bases[key]] = desc
-
     return result
 
 
@@ -196,9 +212,7 @@ def _build_text_tree(
     include_ignored: bool = False,
     descriptions: dict[str, str] | None = None,
 ) -> str:
-    """Build a plain-text tree string suitable for injecting into AI context.
-    If *descriptions* is provided, file entries are annotated with a short description.
-    """
+    """Build a plain-text tree string suitable for injecting into AI context."""
     lines: list[str] = [Path(root).name + "/"]
 
     def _walk(path: Path, prefix: str) -> None:
@@ -209,25 +223,21 @@ def _build_text_tree(
         filtered: list[Path] = []
         ignored_names: list[str] = []
         for e in entries:
-            if not include_ignored:
-                if e.name.startswith("."):
-                    continue
-                if e.is_dir() and e.name in IGNORED_DIRS:
-                    ignored_names.append(e.name)
-                    continue
+            if e.is_dir() and _is_ignored_dir(e, include_ignored):
+                ignored_names.append(e.name)
+                continue
+            if not include_ignored and e.is_file() and e.name.startswith("."):
+                continue
             filtered.append(e)
         for i, entry in enumerate(filtered):
             is_last = (i == len(filtered) - 1) and not ignored_names
             conn = "\u2514\u2500\u2500 " if is_last else "\u251c\u2500\u2500 "
-            suffix = "/" if entry.is_dir() else ""
             if entry.is_dir():
-                lines.append(prefix + conn + entry.name + suffix)
+                lines.append(prefix + conn + entry.name + "/")
                 _walk(entry, prefix + ("    " if is_last else "\u2502   "))
             else:
                 rel = os.path.relpath(str(entry), root)
-                desc_suffix = ""
-                if descriptions and rel in descriptions:
-                    desc_suffix = f"  \u2014 {descriptions[rel]}"
+                desc_suffix = f"  \u2014 {descriptions[rel]}" if descriptions and rel in descriptions else ""
                 lines.append(prefix + conn + entry.name + desc_suffix)
         if ignored_names:
             lines.append(prefix + "\u2514\u2500\u2500 " + f"[{len(ignored_names)} ignored: " + ", ".join(ignored_names) + "]")
@@ -246,25 +256,20 @@ def handle_plan(task: str, messages: list[dict], state: dict) -> None:
         console.print("[error]Usage: /plan <task description>[/error]")
         return
 
-    # Step 1: ask the AI for a plan only
     plan_prompt = (
         f"Create a concise numbered step-by-step plan for the following task. "
         f"Be specific about which files to create or edit and which commands to run. "
-        f"Output the plan only — do NOT start implementing yet.\n\n"
+        f"Output the plan only \u2014 do NOT start implementing yet.\n\n"
         f"Task: {task}"
     )
     messages.append({"role": "user", "content": plan_prompt})
-    console.print(Panel(
-        f"[bold]Planning:[/bold] {task}",
-        title="/plan", border_style=SAKURA_MUTED,
-    ))
+    console.print(Panel(f"[bold]Planning:[/bold] {task}", title="/plan", border_style=SAKURA_MUTED))
     plan_reply = stream_response(messages)
     if not plan_reply:
         messages.pop()
         return
     messages.append({"role": "assistant", "content": plan_reply})
 
-    # Step 2: auto-reprompt to execute
     exec_prompt = (
         "Good plan. Now execute it step by step. "
         "Use <!-- WRITE: path --> markers for any file edits and "
@@ -277,7 +282,6 @@ def handle_plan(task: str, messages: list[dict], state: dict) -> None:
         messages.append({"role": "assistant", "content": exec_reply})
     else:
         messages.pop()
-
     save_session(cwd, messages)
 
 
@@ -334,6 +338,8 @@ def handle_check(arg: str, messages: list[dict], state: dict) -> None:
             if f.is_file() and f.suffix.lower() in _CODE_EXTENSIONS
             and not any(p.startswith(".") for p in f.parts)
             and not any(p in IGNORED_DIRS for p in f.parts)
+            and not any((Path(cwd) / Path(*f.parts[len(Path(cwd).parts):i+1]) / "pyvenv.cfg").exists()
+                        for i in range(len(Path(cwd).parts), len(f.parts)))
         ]
         if not source_files:
             console.print(f"[info]No source files found in {cwd}.[/info]")
@@ -520,7 +526,7 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
 
     elif name == "/loadtree":
         flags = arg.lower().split()
-        include_ignored = "-i" in flags
+        include_ignored   = "-i" in flags
         with_descriptions = "-d" in flags
 
         descriptions: dict[str, str] | None = None
@@ -536,7 +542,7 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
 
         tree_text = _build_text_tree(cwd, include_ignored=include_ignored, descriptions=descriptions)
         note_parts = []
-        if include_ignored: note_parts.append("all directories included")
+        if include_ignored:   note_parts.append("all directories included")
         if with_descriptions: note_parts.append("AI descriptions included")
         note = "(" + ", ".join(note_parts) + ")" if note_parts else "(ignored dirs noted but not expanded)"
         context_block = (
@@ -558,7 +564,7 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
                     root_path = Path(root_str)
                     to_remove = []
                     for d in dirs:
-                        if d.startswith(".") or d in IGNORED_DIRS:
+                        if _is_ignored_dir(root_path / d, include_ignored=False):
                             ignored_found.add(d)
                             to_remove.append(d)
                     for d in to_remove:
@@ -718,6 +724,6 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
         console.print(Panel(_help_table(), title="Help", border_style=SAKURA_DEEP))
 
     else:
-        console.print(f"[error]Unknown command: {name}[error]")
+        console.print(f"[error]Unknown command: {name}[/error]")
 
     return True
