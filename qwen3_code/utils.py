@@ -113,126 +113,123 @@ def run_command(cmd: str, cwd: str = "") -> str:
 # ---------------------------------------------------------------------------
 
 class ConsoleSession:
-    """Maintains a persistent right-side panel showing the full command history.
+    """Runs commands with a live-updating box around all output.
 
-    While a command runs, the terminal is split:
-      - Left 2/3  : live streaming output of the current command
-      - Right 1/3 : scrolling log of all commands run in this session
-
-    After the session ends the history panel is printed as a final summary.
+    Each command streams into a Rich Panel that updates in-place.  After the
+    command finishes the panel stays on screen showing the full output with a
+    coloured border (green = success, red = failure).  When multiple commands
+    are run in one session a summary panel is printed at the end.
     """
+
+    # Maximum output lines kept visible inside the box while streaming.
+    _MAX_VISIBLE = 40
 
     def __init__(self) -> None:
         self.history: list[tuple[str, str, int]] = []  # (cmd, output, returncode)
 
     # ------------------------------------------------------------------
-    # Panel builders
+    # Internal panel builder
     # ------------------------------------------------------------------
 
-    def _history_panel(self, current_cmd: str = ""):
+    def _build_panel(self, cmd: str, lines: list[str], finished: bool, returncode: int):
         from rich.panel import Panel
         from rich.markup import escape as esc
-        lines: list[str] = []
-        for cmd, out, rc in self.history:
-            icon = "[green]\u2713[/green]" if rc == 0 else f"[red]\u2717({rc})[/red]"
-            lines.append(f"{icon} [bold cyan]$ {esc(cmd)}[/bold cyan]")
-            tail = out.splitlines()[-4:]
-            for l in tail:
-                lines.append(f"  [dim]{esc(l[:80])}[/dim]")
-            lines.append("")
-        if current_cmd:
-            lines.append(f"[bold yellow]\u25b6[/bold yellow] [bold]$ {esc(current_cmd)}[/bold]")
-        body = "\n".join(lines).strip() or "[dim]No commands run yet.[/dim]"
-        # local import to avoid circular dep at module level
-        from qwen3_code.theme import SAKURA_MUTED
-        return Panel(body, title="[bold]Console Session[/bold]", border_style=SAKURA_MUTED)
+        from qwen3_code.theme import SAKURA, SAKURA_DARK, SAKURA_MUTED
 
-    @staticmethod
-    def _output_panel(cmd: str, lines: list[str]):
-        from rich.panel import Panel
-        from rich.markup import escape as esc
-        from qwen3_code.theme import SAKURA_MUTED
-        body = "\n".join(esc(l) for l in lines[-40:]) if lines else "[dim]Running\u2026[/dim]"
+        if lines:
+            body = "\n".join(esc(l) for l in lines[-self._MAX_VISIBLE:])
+        else:
+            body = "[dim]Running\u2026[/dim]"
+
+        if not finished:
+            title  = "Running"
+            border = SAKURA_MUTED
+        elif returncode == 0:
+            title  = "\u2713 done"
+            border = SAKURA
+        else:
+            title  = f"exit {returncode}"
+            border = SAKURA_DARK
+
         return Panel(
             f"[bold cyan]$ {esc(cmd)}[/bold cyan]\n\n{body}",
-            title="Running",
-            border_style=SAKURA_MUTED,
+            title=title,
+            border_style=border,
         )
 
     # ------------------------------------------------------------------
-    # Run a single command with split-screen live display
+    # History summary panel
+    # ------------------------------------------------------------------
+
+    def _summary_panel(self):
+        from rich.panel import Panel
+        from rich.markup import escape as esc
+        from qwen3_code.theme import SAKURA_MUTED
+
+        lines: list[str] = []
+        for cmd, out, rc in self.history:
+            icon = "[green]\u2713[/green]" if rc == 0 else f"[red]\u2717 exit {rc}[/red]"
+            lines.append(f"{icon}  [bold cyan]$ {esc(cmd)}[/bold cyan]")
+            for l in out.splitlines()[-3:]:
+                lines.append(f"  [dim]{esc(l[:100])}[/dim]")
+            lines.append("")
+        body = "\n".join(lines).strip() or "[dim](no commands)[/dim]"
+        return Panel(body, title="[bold]Console Session Summary[/bold]", border_style=SAKURA_MUTED)
+
+    # ------------------------------------------------------------------
+    # Run a single command
     # ------------------------------------------------------------------
 
     def run(self, cmd: str, cwd: str = "") -> str:
-        """Run *cmd* with a split-screen live display; return full output string."""
-        from rich.layout import Layout
-        from rich.live   import Live
-        from qwen3_code.theme import console, SAKURA, SAKURA_DARK
+        """Run *cmd*, streaming its output into a live-updating box."""
+        from rich.live import Live
+        from qwen3_code.theme import console
 
         output_lines: list[str] = []
-        returncode = 0
-
-        layout = Layout()
-        layout.split_row(
-            Layout(name="output",  ratio=2),
-            Layout(name="session", ratio=1),
-        )
-        layout["output"].update(self._output_panel(cmd, []))
-        layout["session"].update(self._history_panel(current_cmd=cmd))
+        returncode   = 0
 
         try:
+            proc = subprocess.Popen(
+                cmd, shell=True,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1,
+                cwd=cwd or None,
+            )
+            assert proc.stdout is not None
+
             with Live(
-                layout,
+                self._build_panel(cmd, [], False, 0),
                 console=console,
                 refresh_per_second=15,
                 vertical_overflow="visible",
-                transient=False,
-            ):
-                try:
-                    proc = subprocess.Popen(
-                        cmd, shell=True,
-                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        text=True, bufsize=1,
-                        cwd=cwd or None,
-                    )
-                    assert proc.stdout is not None
-                    for raw_line in proc.stdout:
-                        output_lines.append(raw_line.rstrip())
-                        layout["output"].update(self._output_panel(cmd, output_lines))
-                    proc.wait()
-                    returncode = proc.returncode
-                except Exception as exc:
-                    output_lines.append(f"[error: {exc}]")
-                    returncode = 1
-                # Update session panel with completed entry
-                output_so_far = "\n".join(output_lines)
-                self.history.append((cmd, output_so_far, returncode))
-                layout["output"].update(self._output_panel(cmd, output_lines))
-                layout["session"].update(self._history_panel())
-        except Exception:
-            # Fallback: plain streaming if Live/Layout unavailable
-            console.print(f"[bold]$ {cmd}[/bold]")
-            for line in output_lines:
-                sys.stdout.write(line + "\n")
-            sys.stdout.flush()
+            ) as live:
+                for raw_line in proc.stdout:
+                    output_lines.append(raw_line.rstrip())
+                    live.update(self._build_panel(cmd, output_lines, False, 0))
+                proc.wait()
+                returncode = proc.returncode
+                # Final update so the border colour reflects success/failure
+                live.update(self._build_panel(cmd, output_lines, True, returncode))
 
-        # Status line below the live display
-        status_style = SAKURA if returncode == 0 else SAKURA_DARK
-        console.print(
-            f"[{status_style}]{'\u2713 done' if returncode == 0 else f'exit {returncode}'}[/{status_style}]"
-        )
+        except Exception as exc:
+            # Fallback: run silently then print output in a plain panel
+            output_lines.append(f"[command error: {exc}]")
+            returncode = 1
+            console.print(self._build_panel(cmd, output_lines, True, returncode))
 
-        return "\n".join(output_lines) or "(no output)"
+        output = "\n".join(output_lines)
+        self.history.append((cmd, output, returncode))
+        return output or "(no output)"
 
     def print_summary(self) -> None:
-        """Print a final history panel after all commands are done."""
+        """Print a session summary panel when 2+ commands were run."""
         from qwen3_code.theme import console
         if len(self.history) > 1:
-            console.print(self._history_panel())
+            console.print(self._summary_panel())
 
 
 def run_command_live(cmd: str, cwd: str = "") -> str:
-    """Convenience wrapper: run a single command with the split-screen session UI."""
+    """Convenience wrapper: run one command with the boxed live display."""
     return ConsoleSession().run(cmd, cwd)
 
 
