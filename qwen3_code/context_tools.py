@@ -10,7 +10,6 @@ from qwen3_code.theme import console, SAKURA, SAKURA_DEEP, SAKURA_DARK, SAKURA_M
 
 
 def _ctx_limit() -> int:
-    """Read context_window from live settings (falls back to 128k)."""
     from qwen3_code.settings import _context_window
     return _context_window()
 
@@ -21,14 +20,13 @@ def _ctx_limit() -> int:
 
 def ctx_usage_bar(
     messages: list[dict],
+    pending: list[str] | None = None,
     bar_width: int = 38,
 ) -> str:
-    """Return a Rich-markup string with a coloured usage bar.
-
-    Example:  [green][=========------------------------------][/green]  ~12.3k/128k tokens
-    """
     limit       = _ctx_limit()
     total_chars = sum(len(m.get("content") or "") for m in messages)
+    if pending:
+        total_chars += sum(len(p) for p in pending)
     est_tokens  = max(0, total_chars // 4)
     pct         = min(1.0, est_tokens / limit)
     filled      = int(pct * bar_width)
@@ -52,19 +50,36 @@ def ctx_usage_bar(
 # /context display
 # ---------------------------------------------------------------------------
 
-def ctx_display(messages: list[dict]) -> None:
+def ctx_display(messages: list[dict], state: dict | None = None) -> None:
+    pending     = (state or {}).get("pending_context", [])
     non_system  = [(i, m) for i, m in enumerate(messages) if m["role"] != "system"]
     total_chars = sum(len(m.get("content") or "") for m in messages)
+    total_chars += sum(len(p) for p in pending)
     est_tokens  = max(0, total_chars // 4)
     limit       = _ctx_limit()
 
-    lines: list[str] = [ctx_usage_bar(messages)]
+    lines: list[str] = [ctx_usage_bar(messages, pending)]
     lines.append(f"[dim]  Change limit: /settings context_window <tokens>  (current: {limit:,})[/dim]")
-    lines.append("")
 
+    # --- Staged (pending) items ---
+    if pending:
+        lines.append("")
+        lines.append(f"[bold yellow]\u23f3 Staged ({len(pending)} item(s)) \u2014 will be sent with your next message:[/bold yellow]")
+        for idx, p in enumerate(pending):
+            preview = p.replace("\n", " ")[:100]
+            if len(p) > 100:
+                preview += "\u2026"
+            toks = len(p) // 4
+            lines.append(
+                f"  [yellow][staged {idx}][/yellow]  [dim]{_esc(preview)}[/dim]  [dim]({toks}t)[/dim]"
+            )
+
+    # --- Sent messages ---
+    lines.append("")
     if not non_system:
-        lines.append("[dim]No messages in context.[/dim]")
+        lines.append("[dim]No sent messages in context.[/dim]")
     else:
+        lines.append(f"[dim]Sent messages:[/dim]")
         for i, m in non_system:
             role    = m["role"]
             content = m.get("content") or ""
@@ -73,7 +88,6 @@ def ctx_display(messages: list[dict]) -> None:
             preview = content.replace("\n", " ")[:90]
             if len(content) > 90:
                 preview += "\u2026"
-
             role_colour = "cyan" if role == "user" else SAKURA
             lines.append(
                 f"  [{role_colour}][{i:>3}] {role:<9}[/{role_colour}]"
@@ -82,7 +96,7 @@ def ctx_display(messages: list[dict]) -> None:
             )
 
     lines.append("")
-    lines.append(f"[dim]Total: ~{est_tokens / 1000:.1f}k tokens across {len(non_system)} message(s)[/dim]")
+    lines.append(f"[dim]Total: ~{est_tokens / 1000:.1f}k tokens ({len(non_system)} sent, {len(pending)} staged)[/dim]")
 
     console.print(Panel("\n".join(lines), title="Context", border_style=SAKURA_DEEP))
 
@@ -91,10 +105,14 @@ def ctx_display(messages: list[dict]) -> None:
 # /context clear
 # ---------------------------------------------------------------------------
 
-def ctx_clear(messages: list[dict]) -> None:
+def ctx_clear(messages: list[dict], state: dict | None = None) -> None:
     before = sum(1 for m in messages if m["role"] != "system")
     messages[:] = [m for m in messages if m["role"] == "system"]
-    console.print(f"[info]Cleared {before} message(s). System prompt preserved.[/info]")
+    staged = 0
+    if state and state.get("pending_context"):
+        staged = len(state["pending_context"])
+        state["pending_context"] = []
+    console.print(f"[info]Cleared {before} sent message(s) and {staged} staged item(s). System prompt preserved.[/info]")
 
 
 # ---------------------------------------------------------------------------
@@ -102,14 +120,13 @@ def ctx_clear(messages: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 def ctx_clean(messages: list[dict], state: dict) -> None:
-    """Use the AI to identify and remove low-value messages."""
     non_system = [(i, m) for i, m in enumerate(messages) if m["role"] != "system"]
 
     if len(non_system) < 4:
         console.print("[info]Not enough messages to clean (need at least 4).[/info]")
         return
 
-    ctx_display(messages)
+    ctx_display(messages, state)
 
     summary: list[str] = []
     for i, m in non_system:
@@ -195,7 +212,7 @@ def ctx_clean(messages: list[dict], state: dict) -> None:
     from qwen3_code.session import save_session
     save_session(state["cwd"], messages)
     console.print(f"[info]Removed {len(indices)} message(s), freed ~{saved_tokens / 1000:.1f}k tokens.[/info]")
-    ctx_display(messages)
+    ctx_display(messages, state)
 
 
 # ---------------------------------------------------------------------------
@@ -205,9 +222,9 @@ def ctx_clean(messages: list[dict], state: dict) -> None:
 def handle_context(arg: str, messages: list[dict], state: dict) -> None:
     sub = arg.strip().lower()
     if sub in ("", "display"):
-        ctx_display(messages)
+        ctx_display(messages, state)
     elif sub == "clear":
-        ctx_clear(messages)
+        ctx_clear(messages, state)
     elif sub == "clean":
         ctx_clean(messages, state)
     else:
