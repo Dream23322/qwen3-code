@@ -14,7 +14,7 @@ from rich.table import Table
 from rich.tree import Tree as RichTree
 
 from qwen3_code.theme import console, SAKURA, SAKURA_DEEP, SAKURA_DARK, SAKURA_MUTED
-from qwen3_code.settings import CFG, handle_settings, SETTINGS_PATH
+from qwen3_code.settings import CFG, handle_settings, SETTINGS_PATH, save_settings, DEFAULT_SETTINGS
 from qwen3_code.utils import (
     _short_cwd, resolve_path, read_file, run_command_live,
     IGNORED_DIRS, VC_DIR, SESSION_DIR, STREAM_MAX_LINES, SIZE_REDUCTION_THRESHOLD,
@@ -41,7 +41,6 @@ def _desc_cache_path(cwd: str) -> Path:
 
 
 def _load_desc_cache(cwd: str) -> dict[str, str] | None:
-    """Return cached {rel_path: description} for *cwd*, or None if missing/stale."""
     p = _desc_cache_path(cwd)
     if not p.exists():
         return None
@@ -55,7 +54,6 @@ def _load_desc_cache(cwd: str) -> dict[str, str] | None:
 
 
 def _save_desc_cache(cwd: str, descriptions: dict[str, str]) -> None:
-    """Persist descriptions for *cwd* to disk."""
     _DESC_DIR.mkdir(parents=True, exist_ok=True)
     data: dict = {"_cwd": cwd, "_generated_at": datetime.now().isoformat()}
     data.update(descriptions)
@@ -63,10 +61,9 @@ def _save_desc_cache(cwd: str, descriptions: dict[str, str]) -> None:
 
 
 def _desc_context_block(cwd: str, descriptions: dict[str, str]) -> str:
-    """Build the context string that is injected into pending_context."""
     lines = [f"Project file descriptions for `{cwd}`:", ""]
     for rel, desc in sorted(descriptions.items()):
-        lines.append(f"  {rel}  —  {desc}")
+        lines.append(f"  {rel}  \u2014  {desc}")
     return "\n".join(lines)
 
 
@@ -87,10 +84,55 @@ def _is_ignored_dir(entry: Path, include_ignored: bool) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# /learn
+# ---------------------------------------------------------------------------
+
+def handle_learn(arg: str) -> None:
+    """Toggle or explicitly set learn mode."""
+    a = arg.strip().lower()
+    current: bool = bool(CFG.get("learn_mode", False))
+
+    if a in ("on", "true", "1", "yes"):
+        new_val = True
+    elif a in ("off", "false", "0", "no"):
+        new_val = False
+    elif a == "":
+        new_val = not current  # toggle
+    else:
+        console.print("[error]Usage: /learn  |  /learn on  |  /learn off[/error]")
+        return
+
+    CFG["learn_mode"] = new_val
+    save_settings(CFG)
+
+    if new_val:
+        console.print(Panel(
+            "[bold green]\u2713 Learn mode ON[/bold green]\n\n"
+            "The AI will now:\n"
+            "  \u2022 Explain the [bold]why[/bold] behind every step\n"
+            "  \u2022 Break solutions into small numbered steps\n"
+            "  \u2022 Define jargon and use analogies\n"
+            "  \u2022 Guide you instead of doing everything silently\n"
+            "  \u2022 Encourage you to try parts yourself\n\n"
+            "[dim]Toggle off with [bold]/learn[/bold] or [bold]/learn off[/bold][/dim]",
+            title="/learn",
+            border_style=SAKURA,
+        ))
+    else:
+        console.print(Panel(
+            "[bold]Learn mode OFF[/bold]\n"
+            "[dim]Back to standard concise mode. Toggle on with [bold]/learn[/bold][/dim]",
+            title="/learn",
+            border_style=SAKURA_MUTED,
+        ))
+
+
+# ---------------------------------------------------------------------------
 # /help table
 # ---------------------------------------------------------------------------
 
 def _help_table() -> Table:
+    learn_status = " [green](ON)[/green]" if CFG.get("learn_mode") else ""
     t = Table(show_header=False, box=None, padding=(0, 1), expand=True)
     t.add_column("cmd",  no_wrap=True, min_width=26)
     t.add_column("desc", justify="right")
@@ -107,6 +149,7 @@ def _help_table() -> Table:
         ("/refresh",              f"reload tracked files, prune stale context  {D}(gone files removed){E}"),
         ("/run <cmd>",            "run a shell command  [dim](output streams live)[/dim]"),
         ("/plan <task>",          f"AI plans then auto-executes a task"),
+        ("/learn [on|off]",       f"beginner tutorial mode{learn_status}"),
         ("/clear",                "clear conversation history"),
         ("/check <target>",       f"AI code review  {D}ALL | file | file:func{E}"),
         ("/stackview <type>",     f"inspect state  {D}fh / fhf / sessions / env / tree{E}"),
@@ -155,9 +198,6 @@ def _generate_file_descriptions_streamed(
     files: list[tuple[str, str]],
     cwd: str = "",
 ) -> dict[str, str]:
-    """Generate descriptions one-at-a-time, streaming each via a transient Live panel.
-    If *cwd* is provided the result is saved to the description cache.
-    """
     import ollama
     from rich.live import Live
     from qwen3_code.settings import _model
@@ -504,13 +544,14 @@ def _sv_env(cwd: str, messages: list[dict]) -> None:
         f"  App name        : {_app_name()}",
         f"  Assistant name  : {_assistant_name()}",
         f"  Resume session  : {CFG.get('open_from_last_session')}",
+        f"  Learn mode      : {'ON' if CFG.get('learn_mode') else 'off'}",
         f"  Settings file   : {SETTINGS_PATH}",
         f"  Size-reduction  : >{SIZE_REDUCTION_THRESHOLD*100:.0f}% triggers confirmation",
         f"  CWD             : {cwd}",
         f"  VC dir          : {VC_DIR}",
         f"  Session dir     : {SESSION_DIR}",
         f"  Session file    : {sf}  ({'exists' if sf.exists() else 'none'})",
-        f"  Desc cache      : {_desc_cache_path(cwd)}  ({len(cached)} entries)" if cached else f"  Desc cache      : (none — run /v to generate)",
+        f"  Desc cache      : {_desc_cache_path(cwd)}  ({len(cached)} entries)" if cached else f"  Desc cache      : (none \u2014 run /v to generate)",
         f"  Messages        : {len([m for m in messages if m['role'] != 'system'])}",
         f"  Python          : {_sys.version.split()[0]}  ({_sys.executable})",
     ]
@@ -518,7 +559,6 @@ def _sv_env(cwd: str, messages: list[dict]) -> None:
 
 
 def _sv_tree(cwd: str, state: dict) -> None:
-    """Display tree using cached descriptions and inject them as AI context."""
     cached = _load_desc_cache(cwd)
     if cached is None:
         console.print(
@@ -541,7 +581,6 @@ def _sv_tree(cwd: str, state: dict) -> None:
         title += f"  (cached {ts})"
     console.print(Panel(tree, title=title, border_style=SAKURA_DEEP))
 
-    # Inject into AI context
     state.setdefault("pending_context", []).append(
         _desc_context_block(cwd, cached)
     )
@@ -605,6 +644,9 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
         console.clear()
         console.print("[info]Conversation cleared.[/info]")
 
+    elif name == "/learn":
+        handle_learn(arg)
+
     elif name == "/tree":
         include_ignored = "-i" in arg
         tree = _build_rich_tree(cwd, include_ignored=include_ignored)
@@ -623,7 +665,6 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
             title = f"Tree + descriptions [{_short_cwd(cwd)}]"
             if include_ignored: title += "  (all dirs)"
             console.print(Panel(tree, title=title, border_style=SAKURA_DEEP))
-            # Inject into AI context
             if descriptions:
                 state.setdefault("pending_context", []).append(
                     _desc_context_block(cwd, descriptions)
@@ -637,7 +678,6 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
 
         descriptions: dict[str, str] | None = None
         if with_descriptions:
-            # Try cache first
             descriptions = _load_desc_cache(cwd)
             if descriptions:
                 console.print(f"[dim]Using cached descriptions ({len(descriptions)} files).[/dim]")

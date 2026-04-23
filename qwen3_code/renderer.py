@@ -14,12 +14,38 @@ from rich.syntax import Syntax
 from rich.text import Text
 
 from qwen3_code.theme import console, SAKURA, SAKURA_DEEP, SAKURA_DARK, SAKURA_MUTED
-from qwen3_code.settings import _model, _assistant_name
+from qwen3_code.settings import _model, _assistant_name, _learn_mode
 from qwen3_code.utils import _phys_rows, STREAM_MAX_LINES, PARTIAL_REPROMPT, resolve_path, read_file
 from qwen3_code.partial import (
     reply_has_partial_write, apply_file_writes, apply_file_inserts, apply_command_runs,
     has_read_requests, collect_read_requests, has_inserts,
 )
+
+# ---------------------------------------------------------------------------
+# Learn-mode system message
+# ---------------------------------------------------------------------------
+
+_LEARN_SYSTEM_MSG: dict = {
+    "role": "system",
+    "content": (
+        "LEARN MODE is active. The user is a beginner learning to code. "
+        "Follow these rules for every response:\n"
+        "\n"
+        "1. Explain the WHY behind every step \u2014 don't just show the what.\n"
+        "2. Break solutions into small, numbered steps the user can follow.\n"
+        "3. Define any technical terms or jargon the first time you use them.\n"
+        "4. Use simple analogies to make abstract concepts concrete.\n"
+        "5. When writing code, briefly explain what each key part does immediately after.\n"
+        "6. Don't silently do everything for the user \u2014 if a step is simple enough, "
+        "describe it and let them try first, then provide the answer.\n"
+        "7. Encourage curiosity: point out what they could explore or experiment with next.\n"
+        "8. Keep a friendly, patient, non-condescending tone.\n"
+        "9. If the user's question is unclear, ask one focused clarifying question "
+        "instead of assuming.\n"
+        "10. After answering, offer a quick comprehension check (e.g. \"Does that make sense? "
+        "Try running it and let me know what you see.\")."
+    ),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +216,16 @@ def _do_stream(
     return reply, cancelled
 
 
+def _effective_messages(messages: list[dict]) -> list[dict]:
+    """Return messages with learn-mode system message prepended when active."""
+    if not _learn_mode():
+        return messages
+    # Don't double-insert if already present
+    if messages and messages[0].get("content") == _LEARN_SYSTEM_MSG["content"]:
+        return messages
+    return [_LEARN_SYSTEM_MSG] + messages
+
+
 def stream_response(messages: list[dict], cwd: str = "") -> str:
     """Stream a response from the model.
 
@@ -199,8 +235,10 @@ def stream_response(messages: list[dict], cwd: str = "") -> str:
     - <!-- READ: path --> markers
     - <!-- WRITE: path --> markers
     - <!-- INSERT: path:LINE --> markers (with optional syntax verification)
+    - Learn mode (prepends beginner-friendly system message)
     """
-    full_reply, user_cancelled = _do_stream(messages)
+    effective = _effective_messages(messages)
+    full_reply, user_cancelled = _do_stream(effective)
 
     if not full_reply:
         if user_cancelled:
@@ -218,7 +256,7 @@ def stream_response(messages: list[dict], cwd: str = "") -> str:
                             title="Partial write", border_style=SAKURA_DARK))
         messages.append({"role": "assistant", "content": full_reply})
         messages.append({"role": "user",      "content": PARTIAL_REPROMPT})
-        rr, rc_cancelled = _do_stream(messages, "retrying...")
+        rr, rc_cancelled = _do_stream(_effective_messages(messages), "retrying...")
         messages.pop()
         messages.pop()
         if rc_cancelled:
@@ -253,7 +291,7 @@ def stream_response(messages: list[dict], cwd: str = "") -> str:
             "role": "user",
             "content": "Files you requested:\n\n" + "\n\n".join(file_blocks),
         })
-        new_reply, was_cancelled = _do_stream(messages, "reading files...")
+        new_reply, was_cancelled = _do_stream(_effective_messages(messages), "reading files...")
         if was_cancelled or not new_reply:
             if was_cancelled:
                 console.print("[info]Cancelled.[/info]")

@@ -16,15 +16,17 @@ DEFAULT_SETTINGS: dict = {
     "open_from_last_session": True,
     "context_window":         128000,
     "insert_verify":          True,
+    "learn_mode":             False,
 }
 
 SETTINGS_HELP: dict[str, str] = {
     "app_name":               "Display name shown in the header and panels",
     "assistant_name":         "Label used when the AI is thinking / responding",
     "model":                  "Ollama model tag to use for all inference",
-    "open_from_last_session": "true/false  — resume previous conversation on startup",
-    "context_window":         "Token limit for your model (e.g. 128000, 1000000) — used by /context bar",
-    "insert_verify":          "true/false  — show syntax check + diff preview before applying INSERT markers",
+    "open_from_last_session": "true/false  \u2014 resume previous conversation on startup",
+    "context_window":         "Token limit for your model (e.g. 128000, 1000000) \u2014 used by /context bar",
+    "insert_verify":          "true/false  \u2014 show syntax check + diff preview before applying INSERT markers",
+    "learn_mode":             "true/false  \u2014 beginner tutorial mode: AI explains concepts step-by-step (toggle with /learn)",
 }
 
 
@@ -57,6 +59,7 @@ def _model()          -> str:  return CFG["model"]
 def _app_name()       -> str:  return CFG["app_name"]
 def _assistant_name() -> str:  return CFG["assistant_name"]
 def _context_window() -> int:  return int(CFG.get("context_window", 128_000))
+def _learn_mode()     -> bool: return bool(CFG.get("learn_mode", False))
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +111,6 @@ def handle_settings(arg: str) -> None:
     old = CFG[key]
     CFG[key] = value
     save_settings(CFG)
-    console.print(f"[info][bold cyan]{key}[/bold cyan]: [dim]{old}[/dim] → [bold]{value}[/bold]  saved[/info]")
+    console.print(f"[info][bold cyan]{key}[/bold cyan]: [dim]{old}[/dim] \u2192 [bold]{value}[/bold]  saved[/info]")
     if key == "model":
         console.print(f"[info]Run: ollama pull {value}[/info]")
