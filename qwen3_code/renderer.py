@@ -17,8 +17,8 @@ from qwen3_code.theme import console, SAKURA, SAKURA_DEEP, SAKURA_DARK, SAKURA_M
 from qwen3_code.settings import _model, _assistant_name
 from qwen3_code.utils import _phys_rows, STREAM_MAX_LINES, PARTIAL_REPROMPT, resolve_path, read_file
 from qwen3_code.partial import (
-    reply_has_partial_write, apply_file_writes, apply_command_runs,
-    has_read_requests, collect_read_requests,
+    reply_has_partial_write, apply_file_writes, apply_file_inserts, apply_command_runs,
+    has_read_requests, collect_read_requests, has_inserts,
 )
 
 
@@ -40,7 +40,6 @@ def _status_line(left: str, right: str) -> Text:
 
 
 def _watch_for_cancel(cancel_event: threading.Event) -> None:
-    """Background thread: set *cancel_event* when Ctrl+D is pressed."""
     try:
         import select as _sel, termios as _t, tty as _tty
         fd  = sys.stdin.fileno()
@@ -83,11 +82,18 @@ def render_response(text: str) -> None:
             block_start   = text.find(part)
             prefix        = text[max(0, block_start - 200): block_start]
             wm            = re.search(r"<!--\s*WRITE:\s*([^\s>]+)\s*-->", prefix)
-            title, border = (f"Written to {wm.group(1)}", SAKURA_DEEP) if wm else (f"Code ({lang})", SAKURA)
+            im            = re.search(r"<!--\s*INSERT:\s*([^\s>:]+):(\d+)\s*-->", prefix)
+            if wm:
+                title, border = f"Written to {wm.group(1)}", SAKURA_DEEP
+            elif im:
+                title, border = f"Insert into {im.group(1)} (before line {im.group(2)})", SAKURA
+            else:
+                title, border = f"Code ({lang})", SAKURA
             console.print(Panel(Syntax(code, lang, theme="dracula", line_numbers=True),
                                 title=title, border_style=border))
         else:
             cleaned = re.sub(r"<!--\s*WRITE:[^>]+-->", "", part)
+            cleaned = re.sub(r"<!--\s*INSERT:[^>]+-->", "", cleaned)
             cleaned = re.sub(r"<!--\s*READ:[^>]+-->", "", cleaned)
             cleaned = re.sub(r"<!--\s*RUN:[^>]+-->", "", cleaned).strip()
             if cleaned:
@@ -102,7 +108,6 @@ def _raw_stream(
     messages: list[dict],
     cancel_event: threading.Event | None = None,
 ) -> tuple[str, int]:
-    """Stream tokens with a rolling window; returns (full_text, physical_rows)."""
     full: str         = ""
     window: list[str] = []
     partial: str      = ""
@@ -171,7 +176,6 @@ def _do_stream(
     messages: list[dict],
     status_label: str = "thinking...",
 ) -> tuple[str, bool]:
-    """Run one stream+cancel-watcher cycle. Returns (reply, was_cancelled)."""
     cancel_event = threading.Event()
     console.print()
     console.print(_status_line(status_label, "ctrl+d to cancel"))
@@ -190,9 +194,11 @@ def stream_response(messages: list[dict], cwd: str = "") -> str:
     """Stream a response from the model.
 
     Handles:
-    - Ctrl+D cancel at any point
+    - Ctrl+D cancel
     - Partial-write detection and reprompt
-    - <!-- READ: path --> markers: auto-reads requested files and reprompts
+    - <!-- READ: path --> markers
+    - <!-- WRITE: path --> markers
+    - <!-- INSERT: path:LINE --> markers (with optional syntax verification)
     """
     full_reply, user_cancelled = _do_stream(messages)
 
@@ -223,8 +229,6 @@ def stream_response(messages: list[dict], cwd: str = "") -> str:
             full_reply = rr
 
     # ---- READ request loop -----------------------------------------------
-    # The AI can emit <!-- READ: path --> to request file contents.
-    # We honour up to 3 rounds to avoid infinite loops.
     _MAX_READ_ROUNDS = 3
     for _rnd in range(_MAX_READ_ROUNDS):
         if not has_read_requests(full_reply):
@@ -253,15 +257,14 @@ def stream_response(messages: list[dict], cwd: str = "") -> str:
         if was_cancelled or not new_reply:
             if was_cancelled:
                 console.print("[info]Cancelled.[/info]")
-            # Roll back the messages we added so the loop state is consistent
             messages.pop()
             messages.pop()
             break
-        # Keep the READ context in messages — useful for follow-ups
         full_reply = new_reply
 
     # ---- Final render + apply --------------------------------------------
     render_response(full_reply)
     apply_file_writes(full_reply)
+    apply_file_inserts(full_reply, cwd)
     apply_command_runs(full_reply, cwd, messages)
     return full_reply

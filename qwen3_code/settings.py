@@ -15,6 +15,7 @@ DEFAULT_SETTINGS: dict = {
     "model":                  "huihui_ai/qwen3-coder-abliterated:30b",
     "open_from_last_session": True,
     "context_window":         128000,
+    "insert_verify":          True,
 }
 
 SETTINGS_HELP: dict[str, str] = {
@@ -23,6 +24,7 @@ SETTINGS_HELP: dict[str, str] = {
     "model":                  "Ollama model tag to use for all inference",
     "open_from_last_session": "true/false  — resume previous conversation on startup",
     "context_window":         "Token limit for your model (e.g. 128000, 1000000) — used by /context bar",
+    "insert_verify":          "true/false  — show syntax check + diff preview before applying INSERT markers",
 }
 
 
@@ -62,8 +64,7 @@ def _context_window() -> int:  return int(CFG.get("context_window", 128_000))
 # ---------------------------------------------------------------------------
 
 def handle_settings(arg: str) -> None:
-    """Display or update a setting.  Called by the slash-command dispatcher."""
-    from qwen3_code.theme import console, SAKURA_DEEP  # local import avoids cycle
+    from qwen3_code.theme import console, SAKURA_DEEP
     from rich.panel import Panel
 
     parts: list[str] = arg.strip().split(maxsplit=1)

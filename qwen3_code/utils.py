@@ -20,8 +20,6 @@ SESSION_DIR: Path = Path.home() / ".local" / "share" / "qwen3-code" / "sessions"
 STREAM_MAX_LINES: int        = 10
 SIZE_REDUCTION_THRESHOLD: float = 0.20
 
-# Directories skipped during /read -a  (content not read, but their presence
-# is noted in the context so the AI knows they exist).
 IGNORED_DIRS: set[str] = {
     ".venv", "venv", ".env", "env",
     "node_modules", "__pycache__", ".git", ".hg", ".svn",
@@ -44,33 +42,53 @@ SYSTEM_PROMPT: str = textwrap.dedent("""\
         <!-- RUN: <shell command here> -->
 
     RULES:
-    - You MAY emit multiple RUN markers in one response when a task requires
-      a sequence of commands (e.g. create venv, activate, install, verify).
+    - You MAY emit multiple RUN markers in one response.
     - Place each RUN marker on its own line, in the order they should run.
-    - NEVER simulate or invent command output in a code block. If the user asks
-      you to "run", "execute", or "create a console session", use real RUN
-      markers so the commands actually execute on their machine.
-    - Do NOT emit a RUN marker for commands the user did not request.
+    - NEVER simulate or invent command output in a code block.
     - The tool will ask the user to confirm each command before running it.
 
-    Example — setting up a venv:
-
-        <!-- RUN: python -m venv myenv -->
-        <!-- RUN: myenv\Scripts\activate && pip install requests -->
-
     ============================================================
-    FILE EDITING
+    FILE EDITING  —  full rewrite
     ============================================================
-    When the user asks you to edit or rewrite a file, respond with the
-    complete new file content using this EXACT format:
+    When you need to rewrite an entire file, use:
 
         <!-- WRITE: path/to/file -->
         ```python
         <complete file contents>
         ```
 
-    Always provide the COMPLETE file from top to bottom. The tool will back up
-    the original so the user can /undo at any time.
+    Always provide the COMPLETE file. The tool backs up the original (/undo).
+
+    ============================================================
+    FILE EDITING  —  targeted insertion
+    ============================================================
+    When you only need to INSERT new lines at a specific location WITHOUT
+    rewriting the whole file, use:
+
+        <!-- INSERT: path/to/file:LINE_NUMBER -->
+        ```python
+        <lines to insert>
+        ```
+
+    LINE_NUMBER is 1-based. The new lines are inserted BEFORE that line,
+    pushing existing content down. Use this for adding imports, functions,
+    or blocks when the rest of the file is unchanged.
+
+    Example — insert a new function before line 42 of utils.py:
+
+        <!-- INSERT: utils.py:42 -->
+        ```python
+        def helper():
+            return 42
+        ```
+
+    When insert_verify is enabled (default), the tool will:
+      1. Run a syntax check on the resulting file.
+      2. Show a diff preview around the insertion point.
+      3. Ask the user to confirm before writing.
+
+    Prefer INSERT over WRITE when your change is purely additive and
+    the surrounding code is unchanged.
 
     ============================================================
     REQUESTING FILES
@@ -79,15 +97,8 @@ SYSTEM_PROMPT: str = textwrap.dedent("""\
 
         <!-- READ: path/to/file -->
 
-    You may emit multiple READ markers in one response. The tool will read
-    each file and provide the contents automatically, then reprompt you to
-    continue. Do NOT guess or make up file contents — if you need a file,
-    request it with a READ marker.
-
-    Example — asking for two files before answering:
-
-        <!-- READ: src/main.py -->
-        <!-- READ: src/utils.py -->
+    You may emit multiple READ markers. The tool reads each file and
+    reprompts you automatically. Do NOT guess file contents.
 """).strip()
 
 PARTIAL_REPROMPT: str = (
@@ -101,7 +112,6 @@ PARTIAL_REPROMPT: str = (
 # ---------------------------------------------------------------------------
 
 def _phys_rows(text: str, term_w: int) -> int:
-    """Physical terminal rows a plain-text string occupies."""
     if term_w <= 0 or not text:
         return 1
     return max(1, math.ceil(len(text) / term_w))
@@ -131,7 +141,6 @@ def read_file(path: str) -> str:
 
 
 def run_command(cmd: str, cwd: str = "") -> str:
-    """Run a shell command silently. Returns full output string."""
     try:
         result = subprocess.run(
             cmd, shell=True, capture_output=True, text=True, timeout=30,
@@ -145,26 +154,14 @@ def run_command(cmd: str, cwd: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
-# ConsoleSession  —  live-updating boxed output
+# ConsoleSession
 # ---------------------------------------------------------------------------
 
 class ConsoleSession:
-    """Runs commands with a live-updating Rich Panel around all output.
-
-    Each command streams into a panel that updates in-place.  When the
-    command finishes the border turns green (success) or red (failure).
-    When multiple commands are run in one session a summary panel is
-    printed at the end.
-    """
-
-    _MAX_VISIBLE = 40  # max output lines visible inside the box while streaming
+    _MAX_VISIBLE = 40
 
     def __init__(self) -> None:
-        self.history: list[tuple[str, str, int]] = []  # (cmd, output, returncode)
-
-    # ------------------------------------------------------------------
-    # Panel builders
-    # ------------------------------------------------------------------
+        self.history: list[tuple[str, str, int]] = []
 
     def _build_panel(self, cmd: str, lines: list[str], finished: bool, returncode: int):
         from rich.panel import Panel
@@ -191,12 +188,7 @@ class ConsoleSession:
         body = "\n".join(lines).strip() or "[dim](no commands)[/dim]"
         return Panel(body, title="[bold]Console Session Summary[/bold]", border_style=SAKURA_MUTED)
 
-    # ------------------------------------------------------------------
-    # Run a single command
-    # ------------------------------------------------------------------
-
     def run(self, cmd: str, cwd: str = "") -> str:
-        """Run *cmd*, streaming its output into a live-updating box."""
         from rich.live import Live
         from qwen3_code.theme import console
 
@@ -235,14 +227,12 @@ class ConsoleSession:
         return output or "(no output)"
 
     def print_summary(self) -> None:
-        """Print a session summary panel when 2+ commands were run."""
         from qwen3_code.theme import console
         if len(self.history) > 1:
             console.print(self._summary_panel())
 
 
 def run_command_live(cmd: str, cwd: str = "") -> str:
-    """Convenience wrapper: run one command with the boxed live display."""
     return ConsoleSession().run(cmd, cwd)
 
 
@@ -260,7 +250,6 @@ def build_context_snippet(cwd: str) -> str:
 
 @contextlib.contextmanager
 def spinning_dots(message: str) -> Generator[None, None, None]:
-    """Show an animated '...' spinner on one stdout line while blocking work runs."""
     stop = threading.Event()
     frames = ["   ", ".  ", ".. ", "..."]
 
