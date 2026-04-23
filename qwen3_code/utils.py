@@ -35,20 +35,39 @@ SYSTEM_PROMPT: str = textwrap.dedent("""\
     You help the user understand, write, debug, and refactor code.
     When showing code, always wrap it in fenced code blocks with the correct language tag.
     Be concise and direct. Prefer targeted, minimal changes.
-    If asked to run a shell command, explain what it does first.
 
-    RUNNING COMMANDS - when you want to run a shell command as part of helping
-    the user, emit it using this EXACT marker format:
+    ============================================================
+    RUNNING COMMANDS
+    ============================================================
+    When you need to execute a shell command, emit it using this EXACT marker:
 
-    <!-- RUN: <shell command here> -->
+        <!-- RUN: <shell command here> -->
 
-    The tool will confirm with the user before running. Only emit one RUN marker
-    per response. Never emit a RUN marker for commands the user did not request.
+    RULES:
+    - You MAY emit multiple RUN markers in one response when a task requires
+      a sequence of commands (e.g. create venv, activate, install, verify).
+    - Place each RUN marker on its own line, in the order they should run.
+    - NEVER simulate or invent command output in a code block. If the user asks
+      you to "run", "execute", or "create a console session", use real RUN
+      markers so the commands actually execute on their machine.
+    - Do NOT emit a RUN marker for commands the user did not request.
+    - The tool will ask the user to confirm each command before running it.
 
-    FILE EDITING - when the user asks you to edit or rewrite a file, respond with
-    the complete new file content using this EXACT format:
+    Example — setting up a venv:
 
-    <!-- WRITE: path/to/file -->
+        <!-- RUN: python -m venv myenv -->
+        <!-- RUN: myenv\Scripts\activate && pip install requests -->
+
+    ============================================================
+    FILE EDITING
+    ============================================================
+    When the user asks you to edit or rewrite a file, respond with the
+    complete new file content using this EXACT format:
+
+        <!-- WRITE: path/to/file -->
+        ```python
+        <complete file contents>
+        ```
 
     Always provide the COMPLETE file from top to bottom. The tool will back up
     the original so the user can /undo at any time.
@@ -109,26 +128,25 @@ def run_command(cmd: str, cwd: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
-# Split-screen console session
+# ConsoleSession  —  live-updating boxed output
 # ---------------------------------------------------------------------------
 
 class ConsoleSession:
-    """Runs commands with a live-updating box around all output.
+    """Runs commands with a live-updating Rich Panel around all output.
 
-    Each command streams into a Rich Panel that updates in-place.  After the
-    command finishes the panel stays on screen showing the full output with a
-    coloured border (green = success, red = failure).  When multiple commands
-    are run in one session a summary panel is printed at the end.
+    Each command streams into a panel that updates in-place.  When the
+    command finishes the border turns green (success) or red (failure).
+    When multiple commands are run in one session a summary panel is
+    printed at the end.
     """
 
-    # Maximum output lines kept visible inside the box while streaming.
-    _MAX_VISIBLE = 40
+    _MAX_VISIBLE = 40  # max output lines visible inside the box while streaming
 
     def __init__(self) -> None:
         self.history: list[tuple[str, str, int]] = []  # (cmd, output, returncode)
 
     # ------------------------------------------------------------------
-    # Internal panel builder
+    # Panel builders
     # ------------------------------------------------------------------
 
     def _build_panel(self, cmd: str, lines: list[str], finished: bool, returncode: int):
@@ -136,30 +154,10 @@ class ConsoleSession:
         from rich.markup import escape as esc
         from qwen3_code.theme import SAKURA, SAKURA_DARK, SAKURA_MUTED
 
-        if lines:
-            body = "\n".join(esc(l) for l in lines[-self._MAX_VISIBLE:])
-        else:
-            body = "[dim]Running\u2026[/dim]"
-
-        if not finished:
-            title  = "Running"
-            border = SAKURA_MUTED
-        elif returncode == 0:
-            title  = "\u2713 done"
-            border = SAKURA
-        else:
-            title  = f"exit {returncode}"
-            border = SAKURA_DARK
-
-        return Panel(
-            f"[bold cyan]$ {esc(cmd)}[/bold cyan]\n\n{body}",
-            title=title,
-            border_style=border,
-        )
-
-    # ------------------------------------------------------------------
-    # History summary panel
-    # ------------------------------------------------------------------
+        body   = "\n".join(esc(l) for l in lines[-self._MAX_VISIBLE:]) if lines else "[dim]Running\u2026[/dim]"
+        title  = ("Running" if not finished else ("\u2713 done" if returncode == 0 else f"exit {returncode}"))
+        border = SAKURA_MUTED if not finished else (SAKURA if returncode == 0 else SAKURA_DARK)
+        return Panel(f"[bold cyan]$ {esc(cmd)}[/bold cyan]\n\n{body}", title=title, border_style=border)
 
     def _summary_panel(self):
         from rich.panel import Panel
@@ -208,11 +206,9 @@ class ConsoleSession:
                     live.update(self._build_panel(cmd, output_lines, False, 0))
                 proc.wait()
                 returncode = proc.returncode
-                # Final update so the border colour reflects success/failure
                 live.update(self._build_panel(cmd, output_lines, True, returncode))
 
         except Exception as exc:
-            # Fallback: run silently then print output in a plain panel
             output_lines.append(f"[command error: {exc}]")
             returncode = 1
             console.print(self._build_panel(cmd, output_lines, True, returncode))
