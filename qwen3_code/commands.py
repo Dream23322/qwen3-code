@@ -11,8 +11,8 @@ from rich.table import Table
 from qwen3_code.theme import console, SAKURA, SAKURA_DEEP, SAKURA_DARK, SAKURA_MUTED
 from qwen3_code.settings import CFG, handle_settings, SETTINGS_PATH
 from qwen3_code.utils import (
-    _short_cwd, resolve_path, read_file, run_command,
-    VC_DIR, SESSION_DIR, STREAM_MAX_LINES, SIZE_REDUCTION_THRESHOLD,
+    _short_cwd, resolve_path, read_file, run_command_live,
+    IGNORED_DIRS, VC_DIR, SESSION_DIR, STREAM_MAX_LINES, SIZE_REDUCTION_THRESHOLD,
 )
 from qwen3_code.session import save_session, load_session, _session_path
 from qwen3_code.vc import (
@@ -35,9 +35,9 @@ def _help_table() -> Table:
         ("[bold]General[/bold]", ""),
         ("/cd [dir]",            "change working directory"),
         ("/read <file>",         f"load file into context  {D}(saves baseline snapshot){E}"),
-        ("/read -a",             f"load ALL files recursively  {D}(saves baseline snapshots){E}"),
+        ("/read -a",             f"load ALL files recursively  {D}(skips venv/node_modules etc){E}"),
         ("/refresh",             f"reload tracked files, prune stale context  {D}(gone files removed){E}"),
-        ("/run <cmd>",           "run a shell command"),
+        ("/run <cmd>",           "run a shell command  [dim](output streams live)[/dim]"),
         ("/clear",               "clear conversation history"),
         ("/check <target>",      f"AI code review  {D}ALL | file | file:func{E}"),
         ("/stackview <type>",    f"inspect state  {D}fh / fhf / sessions / env{E}"),
@@ -113,6 +113,7 @@ def handle_check(arg: str, messages: list[dict], state: dict) -> None:
             f for f in Path(cwd).rglob("*")
             if f.is_file() and f.suffix.lower() in _CODE_EXTENSIONS
             and not any(p.startswith(".") for p in f.parts)
+            and not any(p in IGNORED_DIRS for p in f.parts)
         ]
         if not source_files:
             console.print(f"[info]No source files found in {cwd}.[/info]")
@@ -295,9 +296,21 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
         if not arg:
             console.print("[error]Usage: /read <filepath> | /read -a[/error]")
         elif arg.strip() == "-a":
+            ignored_found: set[str] = set()
+            all_files: list[Path]   = []
             try:
-                all_files = [f for f in Path(cwd).rglob("*")
-                             if f.is_file() and not any(p.startswith(".") for p in f.parts)]
+                for root_str, dirs, files in os.walk(cwd):
+                    root_path = Path(root_str)
+                    to_remove = []
+                    for d in dirs:
+                        if d.startswith(".") or d in IGNORED_DIRS:
+                            ignored_found.add(d)
+                            to_remove.append(d)
+                    for d in to_remove:
+                        dirs.remove(d)
+                    for fname in files:
+                        if not fname.startswith("."):
+                            all_files.append(root_path / fname)
             except Exception as exc:
                 console.print(f"[error]{exc}[/error]")
             else:
@@ -316,10 +329,22 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
                 if skipped:
                     console.print("[info]Skipped: " + ", ".join(skipped[:5]) + ("..." if len(skipped) > 5 else "") + "[/info]")
                 if snippets:
+                    ignored_note = ""
+                    if ignored_found:
+                        dirs_list = ", ".join(f"{d}/" for d in sorted(ignored_found))
+                        ignored_note = (
+                            f"\n\n[Note: the following directories exist but were not loaded "
+                            f"(dependencies / generated / VCS): {dirs_list}]"
+                        )
                     state.setdefault("pending_context", []).append(
-                        f"Here are all {len(snippets)} file(s) from `{cwd}`:\n\n" + "\n\n".join(snippets)
+                        f"Here are all {len(snippets)} file(s) from `{cwd}`:\n\n"
+                        + "\n\n".join(snippets)
+                        + ignored_note
                     )
-                    console.print(f"[info]Loaded {len(snippets)} file(s)" + (f", {baselined} baseline(s) saved." if baselined else ".") + "[/info]")
+                    msg = f"[info]Loaded {len(snippets)} file(s)"
+                    if baselined: msg += f", {baselined} baseline(s) saved"
+                    if ignored_found: msg += f"  [dim](noted {len(ignored_found)} ignored dir(s))[/dim]"
+                    console.print(msg + ".[/info]")
                 else:
                     console.print("[info]No readable files found.[/info]")
         else:
@@ -342,9 +367,8 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
         if not arg:
             console.print("[error]Usage: /run <shell command>[/error]")
         else:
-            output = run_command(arg)
+            output = run_command_live(arg, cwd)
             messages.append({"role": "user", "content": f"Output of `{arg}`:\n\n```\n{output}\n```"})
-            console.print(Panel(output, title=f"$ {arg}", border_style=SAKURA_MUTED))
 
     elif name == "/undo":
         tracked = all_tracked_files()
