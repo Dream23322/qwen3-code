@@ -1,8 +1,11 @@
 """Slash-command handlers and the main dispatcher."""
 
+import hashlib
+import json
 import os
 import re
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 
 from rich.markup import escape as _esc
@@ -26,11 +29,52 @@ from qwen3_code.renderer import stream_response
 from qwen3_code.context_tools import handle_context
 
 # ---------------------------------------------------------------------------
+# Description cache
+# ---------------------------------------------------------------------------
+
+_DESC_DIR: Path = Path.home() / ".local" / "share" / "qwen3-code" / "descriptions"
+
+
+def _desc_cache_path(cwd: str) -> Path:
+    h = hashlib.sha1(cwd.encode("utf-8")).hexdigest()[:16]
+    return _DESC_DIR / f"{h}.json"
+
+
+def _load_desc_cache(cwd: str) -> dict[str, str] | None:
+    """Return cached {rel_path: description} for *cwd*, or None if missing/stale."""
+    p = _desc_cache_path(cwd)
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if data.get("_cwd") != cwd:
+            return None
+        return {k: v for k, v in data.items() if not k.startswith("_")}
+    except Exception:
+        return None
+
+
+def _save_desc_cache(cwd: str, descriptions: dict[str, str]) -> None:
+    """Persist descriptions for *cwd* to disk."""
+    _DESC_DIR.mkdir(parents=True, exist_ok=True)
+    data: dict = {"_cwd": cwd, "_generated_at": datetime.now().isoformat()}
+    data.update(descriptions)
+    _desc_cache_path(cwd).write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def _desc_context_block(cwd: str, descriptions: dict[str, str]) -> str:
+    """Build the context string that is injected into pending_context."""
+    lines = [f"Project file descriptions for `{cwd}`:", ""]
+    for rel, desc in sorted(descriptions.items()):
+        lines.append(f"  {rel}  —  {desc}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _is_ignored_dir(entry: Path, include_ignored: bool) -> bool:
-    """Return True if *entry* (a directory) should be skipped."""
     if include_ignored:
         return False
     if entry.name.startswith("."):
@@ -57,7 +101,7 @@ def _help_table() -> Table:
         ("/read <file>",          f"load file into context  {D}(saves baseline snapshot){E}"),
         ("/read -a",              f"load ALL files recursively  {D}(skips venv/node_modules etc){E}"),
         ("/tree [-i]",            f"show project file tree  {D}(-i includes ignored dirs){E}"),
-        ("/v [-i]",               f"show tree with AI descriptions  {D}(streamed one-by-one){E}"),
+        ("/v [-i]",               f"generate + cache AI descriptions, show tree  {D}(streamed){E}"),
         ("/loadtree [-i] [-d]",   f"inject project tree into AI context  {D}(-i incl. ignored, -d adds AI descriptions){E}"),
         ("/context [sub]",        f"context tools  {D}display / clear / clean{E}"),
         ("/refresh",              f"reload tracked files, prune stale context  {D}(gone files removed){E}"),
@@ -109,7 +153,11 @@ def _collect_files_for_tree(
 
 def _generate_file_descriptions_streamed(
     files: list[tuple[str, str]],
+    cwd: str = "",
 ) -> dict[str, str]:
+    """Generate descriptions one-at-a-time, streaming each via a transient Live panel.
+    If *cwd* is provided the result is saved to the description cache.
+    """
     import ollama
     from rich.live import Live
     from qwen3_code.settings import _model
@@ -162,6 +210,10 @@ def _generate_file_descriptions_streamed(
         desc = "".join(tokens).strip().splitlines()[0].strip()
         if desc:
             result[rel] = desc
+
+    if cwd and result:
+        _save_desc_cache(cwd, result)
+        console.print(f"[dim]Descriptions cached ({len(result)} files).[/dim]")
 
     return result
 
@@ -394,7 +446,7 @@ _SV_TYPES = {
     "fhf":      "File history full (all projects)",
     "sessions": "Saved sessions",
     "env":      "Runtime environment info",
-    "tree":     "Project tree with AI descriptions",
+    "tree":     "Project tree (uses cached AI descriptions; run /v to generate)",
 }
 
 
@@ -432,7 +484,6 @@ def _sv_sessions() -> None:
     if not SESSION_DIR.exists() or not list(SESSION_DIR.glob("*.json")):
         console.print("[info]No sessions saved yet.[/info]")
         return
-    import json
     rows = []
     for sf in sorted(SESSION_DIR.glob("*.json")):
         try:
@@ -447,6 +498,7 @@ def _sv_env(cwd: str, messages: list[dict]) -> None:
     import sys as _sys
     sf = _session_path(cwd)
     from qwen3_code.settings import SETTINGS_PATH, _model, _app_name, _assistant_name
+    cached = _load_desc_cache(cwd)
     rows = [
         f"  Model           : {_model()}",
         f"  App name        : {_app_name()}",
@@ -458,30 +510,51 @@ def _sv_env(cwd: str, messages: list[dict]) -> None:
         f"  VC dir          : {VC_DIR}",
         f"  Session dir     : {SESSION_DIR}",
         f"  Session file    : {sf}  ({'exists' if sf.exists() else 'none'})",
+        f"  Desc cache      : {_desc_cache_path(cwd)}  ({len(cached)} entries)" if cached else f"  Desc cache      : (none — run /v to generate)",
         f"  Messages        : {len([m for m in messages if m['role'] != 'system'])}",
         f"  Python          : {_sys.version.split()[0]}  ({_sys.executable})",
     ]
     console.print(Panel("\n".join(rows), title="Environment", border_style=SAKURA_DEEP))
 
 
-def _sv_tree(cwd: str) -> None:
-    file_list = _collect_files_for_tree(cwd, include_ignored=False)
-    if not file_list:
-        console.print("[info]No files found.[/info]")
+def _sv_tree(cwd: str, state: dict) -> None:
+    """Display tree using cached descriptions and inject them as AI context."""
+    cached = _load_desc_cache(cwd)
+    if cached is None:
+        console.print(
+            "[info]No cached descriptions for this directory.\n"
+            "Run [bold]/v[/bold] or [bold]/loadtree -d[/bold] to generate and cache them.[/info]"
+        )
         return
-    console.print(f"[dim]Generating AI descriptions for {len(file_list[:40])} file(s)\u2026[/dim]")
-    descriptions = _generate_file_descriptions_streamed(file_list)
-    tree = _build_rich_tree(cwd, include_ignored=False, descriptions=descriptions)
-    console.print(Panel(tree, title=f"Tree + AI descriptions [{_short_cwd(cwd)}]", border_style=SAKURA_DEEP))
+
+    tree = _build_rich_tree(cwd, include_ignored=False, descriptions=cached)
+    ts   = ""
+    cp   = _desc_cache_path(cwd)
+    if cp.exists():
+        try:
+            meta = json.loads(cp.read_text(encoding="utf-8"))
+            ts   = meta.get("_generated_at", "")[:19].replace("T", "  ")
+        except Exception:
+            pass
+    title = f"Tree + AI descriptions [{_short_cwd(cwd)}]"
+    if ts:
+        title += f"  (cached {ts})"
+    console.print(Panel(tree, title=title, border_style=SAKURA_DEEP))
+
+    # Inject into AI context
+    state.setdefault("pending_context", []).append(
+        _desc_context_block(cwd, cached)
+    )
+    console.print(f"[dim]Descriptions ({len(cached)} files) added to AI context.[/dim]")
 
 
-def handle_stackview(sv_type: str, cwd: str, messages: list[dict]) -> None:
+def handle_stackview(sv_type: str, cwd: str, messages: list[dict], state: dict) -> None:
     t = sv_type.strip().lower()
     if t == "fh":                     _sv_fh(cwd)
     elif t == "fhf":                  _sv_fhf()
     elif t in ("sessions", "sess"):   _sv_sessions()
     elif t in ("env", "environment"): _sv_env(cwd, messages)
-    elif t == "tree":                 _sv_tree(cwd)
+    elif t == "tree":                 _sv_tree(cwd, state)
     elif t in ("", "help"):
         rows = [f"  {k:<12}  {v}" for k, v in _SV_TYPES.items()]
         console.print(Panel("\n".join(rows), title="/stackview types", border_style=SAKURA_DEEP))
@@ -545,11 +618,17 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
             console.print("[info]No files found.[/info]")
         else:
             console.print(f"[dim]Generating descriptions for {len(file_list[:40])} file(s)\u2026[/dim]")
-            descriptions = _generate_file_descriptions_streamed(file_list)
+            descriptions = _generate_file_descriptions_streamed(file_list, cwd=cwd)
             tree = _build_rich_tree(cwd, include_ignored=include_ignored, descriptions=descriptions)
             title = f"Tree + descriptions [{_short_cwd(cwd)}]"
             if include_ignored: title += "  (all dirs)"
             console.print(Panel(tree, title=title, border_style=SAKURA_DEEP))
+            # Inject into AI context
+            if descriptions:
+                state.setdefault("pending_context", []).append(
+                    _desc_context_block(cwd, descriptions)
+                )
+                console.print(f"[dim]Descriptions added to AI context.[/dim]")
 
     elif name == "/loadtree":
         flags = arg.lower().split()
@@ -558,11 +637,16 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
 
         descriptions: dict[str, str] | None = None
         if with_descriptions:
-            file_list = _collect_files_for_tree(cwd, include_ignored=include_ignored)
-            if file_list:
-                console.print(f"[dim]Generating descriptions for {len(file_list[:40])} file(s)\u2026[/dim]")
-                descriptions = _generate_file_descriptions_streamed(file_list)
-                console.print(f"[dim]Got descriptions for {len(descriptions)} file(s).[/dim]")
+            # Try cache first
+            descriptions = _load_desc_cache(cwd)
+            if descriptions:
+                console.print(f"[dim]Using cached descriptions ({len(descriptions)} files).[/dim]")
+            else:
+                file_list = _collect_files_for_tree(cwd, include_ignored=include_ignored)
+                if file_list:
+                    console.print(f"[dim]Generating descriptions for {len(file_list[:40])} file(s)\u2026[/dim]")
+                    descriptions = _generate_file_descriptions_streamed(file_list, cwd=cwd)
+                    console.print(f"[dim]Got descriptions for {len(descriptions)} file(s).[/dim]")
 
         tree_text = _build_text_tree(cwd, include_ignored=include_ignored, descriptions=descriptions)
         note_parts = []
@@ -723,7 +807,7 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
         if not arg: console.print("[error]Usage: /check ALL | <file> | <file>:<func>[/error]")
         else:       handle_check(arg, messages, state)
 
-    elif name == "/stackview":  handle_stackview(arg, cwd, messages)
+    elif name == "/stackview":  handle_stackview(arg, cwd, messages, state)
     elif name == "/settings":   handle_settings(arg)
 
     elif name == "/commit":
