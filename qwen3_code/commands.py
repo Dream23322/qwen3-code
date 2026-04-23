@@ -23,15 +23,14 @@ from qwen3_code.vc import (
 )
 from qwen3_code.refresh import handle_refresh
 from qwen3_code.renderer import stream_response
+from qwen3_code.context_tools import handle_context
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _is_ignored_dir(entry: Path, include_ignored: bool) -> bool:
-    """Return True if *entry* (a directory) should be skipped.
-    Skips dot-dirs, IGNORED_DIRS, and any directory with pyvenv.cfg (custom venvs).
-    """
+    """Return True if *entry* (a directory) should be skipped."""
     if include_ignored:
         return False
     if entry.name.startswith("."):
@@ -54,30 +53,31 @@ def _help_table() -> Table:
     D, E = "[dim]", "[/dim]"
     rows = [
         ("[bold]General[/bold]", ""),
-        ("/cd [dir]",            "change working directory"),
-        ("/read <file>",         f"load file into context  {D}(saves baseline snapshot){E}"),
-        ("/read -a",             f"load ALL files recursively  {D}(skips venv/node_modules etc){E}"),
-        ("/tree [-i]",           f"show project file tree  {D}(-i includes ignored dirs){E}"),
-        ("/v [-i]",              f"show tree with AI descriptions  {D}(streamed one-by-one){E}"),
-        ("/loadtree [-i] [-d]",  f"inject project tree into AI context  {D}(-i incl. ignored, -d adds AI descriptions){E}"),
-        ("/refresh",             f"reload tracked files, prune stale context  {D}(gone files removed){E}"),
-        ("/run <cmd>",           "run a shell command  [dim](output streams live)[/dim]"),
-        ("/plan <task>",         f"AI plans then auto-executes a task"),
-        ("/clear",               "clear conversation history"),
-        ("/check <target>",      f"AI code review  {D}ALL | file | file:func{E}"),
-        ("/stackview <type>",    f"inspect state  {D}fh / fhf / sessions / env{E}"),
-        ("/settings [key val]",  f"view/edit settings  {D}(saved to settings.json){E}"),
-        ("/history",             "show message history"),
-        ("/help",                "show this help"),
-        ("/quit",                "exit"),
+        ("/cd [dir]",             "change working directory"),
+        ("/read <file>",          f"load file into context  {D}(saves baseline snapshot){E}"),
+        ("/read -a",              f"load ALL files recursively  {D}(skips venv/node_modules etc){E}"),
+        ("/tree [-i]",            f"show project file tree  {D}(-i includes ignored dirs){E}"),
+        ("/v [-i]",               f"show tree with AI descriptions  {D}(streamed one-by-one){E}"),
+        ("/loadtree [-i] [-d]",   f"inject project tree into AI context  {D}(-i incl. ignored, -d adds AI descriptions){E}"),
+        ("/context [sub]",        f"context tools  {D}display / clear / clean{E}"),
+        ("/refresh",              f"reload tracked files, prune stale context  {D}(gone files removed){E}"),
+        ("/run <cmd>",            "run a shell command  [dim](output streams live)[/dim]"),
+        ("/plan <task>",          f"AI plans then auto-executes a task"),
+        ("/clear",                "clear conversation history"),
+        ("/check <target>",       f"AI code review  {D}ALL | file | file:func{E}"),
+        ("/stackview <type>",     f"inspect state  {D}fh / fhf / sessions / env{E}"),
+        ("/settings [key val]",   f"view/edit settings  {D}(saved to settings.json){E}"),
+        ("/history",              "show message history"),
+        ("/help",                 "show this help"),
+        ("/quit",                 "exit"),
         ("", ""),
         ("[bold]Version control[/bold]", f"{D}git-like, tree-based{E}"),
-        ("/undo [file]",         "move HEAD to parent commit"),
-        ("/redo [file] [id]",    f"move HEAD to child  {D}(menu if branched){E}"),
-        ("/checkout <id> [file]","check out any commit by ID"),
-        ("/commit <file> [msg]", "manually commit current file state"),
-        ("/log [file]",          "show commit tree"),
-        ("/files",               "list all tracked files"),
+        ("/undo [file]",          "move HEAD to parent commit"),
+        ("/redo [file] [id]",     f"move HEAD to child  {D}(menu if branched){E}"),
+        ("/checkout <id> [file]", "check out any commit by ID"),
+        ("/commit <file> [msg]",  "manually commit current file state"),
+        ("/log [file]",           "show commit tree"),
+        ("/files",                "list all tracked files"),
     ]
     for cmd_text, desc_text in rows:
         t.add_row(f"  {cmd_text}", desc_text)
@@ -92,7 +92,6 @@ def _collect_files_for_tree(
     root: str,
     include_ignored: bool = False,
 ) -> list[tuple[str, str]]:
-    """Return (rel_path, abs_path) for every non-ignored file under *root*."""
     results: list[tuple[str, str]] = []
     for rdir, dirs, fnames in os.walk(root):
         rpath = Path(rdir)
@@ -111,12 +110,6 @@ def _collect_files_for_tree(
 def _generate_file_descriptions_streamed(
     files: list[tuple[str, str]],
 ) -> dict[str, str]:
-    """Ask the model for a description of each file ONE AT A TIME, streaming
-    each token into a live-updating panel so the user can watch.
-
-    Shows only the current file's name + its description as it streams.
-    Returns {rel_path: description}.
-    """
     import ollama
     from rich.live import Live
     from qwen3_code.settings import _model
@@ -134,17 +127,17 @@ def _generate_file_descriptions_streamed(
 
         prompt = (
             "Give a single short description of this file (8 words max). "
-            "Output ONLY the description — no filename, no prefix, no punctuation at the end.\n\n"
+            "Output ONLY the description \u2014 no filename, no prefix, no punctuation at the end.\n\n"
             f"File: {rel}\n{snippet}"
         )
 
         tokens: list[str] = []
         progress = f"[dim]({idx}/{total})[/dim]"
 
-        def _panel(desc_so_far: str) -> Panel:
+        def _panel(desc_so_far: str, _rel: str = rel, _prog: str = progress) -> Panel:
             body = (
-                f"{progress}  [bold]{_esc(rel)}[/bold]\n"
-                f"[dim]{_esc(desc_so_far) if desc_so_far else 'thinking…'}[/dim]"
+                f"{_prog}  [bold]{_esc(_rel)}[/bold]\n"
+                f"[dim]{_esc(desc_so_far) if desc_so_far else 'thinking\u2026'}[/dim]"
             )
             return Panel(body, title="Describing files", border_style=SAKURA_MUTED)
 
@@ -153,7 +146,7 @@ def _generate_file_descriptions_streamed(
                 _panel(""),
                 console=console,
                 refresh_per_second=20,
-                transient=True,   # erase when done
+                transient=True,
             ) as live:
                 for chunk in ollama.chat(
                     model=_model(),
@@ -178,9 +171,6 @@ def _build_rich_tree(
     include_ignored: bool = False,
     descriptions: dict[str, str] | None = None,
 ) -> RichTree:
-    """Build a Rich Tree for display.  If *descriptions* is provided,
-    file entries include an AI-generated one-liner.
-    """
     tracked = set(all_tracked_files())
 
     def _add_children(node: RichTree, path: Path) -> None:
@@ -222,7 +212,6 @@ def _build_text_tree(
     include_ignored: bool = False,
     descriptions: dict[str, str] | None = None,
 ) -> str:
-    """Build a plain-text tree suitable for injecting into AI context."""
     lines: list[str] = [Path(root).name + "/"]
 
     def _walk(path: Path, prefix: str) -> None:
@@ -538,7 +527,6 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
                             border_style=SAKURA_DEEP))
 
     elif name == "/v":
-        # Visual tree with AI-generated descriptions, streamed one file at a time
         include_ignored = "-i" in arg
         file_list = _collect_files_for_tree(cwd, include_ignored=include_ignored)
         if not file_list:
@@ -576,6 +564,9 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
         state.setdefault("pending_context", []).append(context_block)
         line_count = tree_text.count("\n") + 1
         console.print(f"[info]Project tree loaded into context ({line_count} lines). {note}[/info]")
+
+    elif name == "/context":
+        handle_context(arg, messages, state)
 
     elif name == "/read":
         if not arg:
