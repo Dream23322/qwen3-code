@@ -7,6 +7,7 @@ from pathlib import Path
 
 from rich.panel import Panel
 from rich.table import Table
+from rich.tree import Tree as RichTree
 
 from qwen3_code.theme import console, SAKURA, SAKURA_DEEP, SAKURA_DARK, SAKURA_MUTED
 from qwen3_code.settings import CFG, handle_settings, SETTINGS_PATH
@@ -36,8 +37,11 @@ def _help_table() -> Table:
         ("/cd [dir]",            "change working directory"),
         ("/read <file>",         f"load file into context  {D}(saves baseline snapshot){E}"),
         ("/read -a",             f"load ALL files recursively  {D}(skips venv/node_modules etc){E}"),
+        ("/tree [-i]",           f"show project file tree  {D}(-i includes ignored dirs){E}"),
+        ("/loadtree [-i]",       f"inject project tree into AI context  {D}(-i includes ignored){E}"),
         ("/refresh",             f"reload tracked files, prune stale context  {D}(gone files removed){E}"),
         ("/run <cmd>",           "run a shell command  [dim](output streams live)[/dim]"),
+        ("/plan <task>",         f"AI plans then auto-executes a task"),
         ("/clear",               "clear conversation history"),
         ("/check <target>",      f"AI code review  {D}ALL | file | file:func{E}"),
         ("/stackview <type>",    f"inspect state  {D}fh / fhf / sessions / env{E}"),
@@ -60,6 +64,127 @@ def _help_table() -> Table:
 
 
 # ---------------------------------------------------------------------------
+# Tree helpers
+# ---------------------------------------------------------------------------
+
+def _build_rich_tree(root: str, include_ignored: bool = False) -> RichTree:
+    """Build a Rich Tree widget of the filesystem under *root*.
+    Tracked files are highlighted; ignored dirs are collapsed unless *include_ignored*.
+    """
+    tracked = set(all_tracked_files())
+
+    def _add_children(node: RichTree, path: Path) -> None:
+        try:
+            entries = sorted(path.iterdir(), key=lambda x: (x.is_file(), x.name.lower()))
+        except PermissionError:
+            return
+        ignored_names: list[str] = []
+        for entry in entries:
+            if not include_ignored:
+                if entry.name.startswith("."):
+                    continue
+                if entry.is_dir() and entry.name in IGNORED_DIRS:
+                    ignored_names.append(entry.name)
+                    continue
+            if entry.is_dir():
+                branch = node.add(f"[bold]{entry.name}/[/bold]")
+                _add_children(branch, entry)
+            else:
+                is_tracked = str(entry.resolve()) in tracked
+                if is_tracked:
+                    node.add(f"[{SAKURA}]{entry.name}[/{SAKURA}] [dim](tracked)[/dim]")
+                else:
+                    node.add(f"[dim]{entry.name}[/dim]")
+        if ignored_names and not include_ignored:
+            node.add(f"[dim italic]… {len(ignored_names)} ignored dir(s): {", ".join(ignored_names)}[/dim italic]")
+
+    root_label = f"[bold]{Path(root).name}/[/bold]"
+    tree = RichTree(root_label)
+    _add_children(tree, Path(root))
+    return tree
+
+
+def _build_text_tree(root: str, include_ignored: bool = False) -> str:
+    """Build a plain-text tree string suitable for injecting into AI context."""
+    lines: list[str] = [Path(root).name + "/"]
+
+    def _walk(path: Path, prefix: str) -> None:
+        try:
+            entries = sorted(path.iterdir(), key=lambda x: (x.is_file(), x.name.lower()))
+        except PermissionError:
+            return
+        filtered: list[Path] = []
+        ignored_names: list[str] = []
+        for e in entries:
+            if not include_ignored:
+                if e.name.startswith("."):
+                    continue
+                if e.is_dir() and e.name in IGNORED_DIRS:
+                    ignored_names.append(e.name)
+                    continue
+            filtered.append(e)
+        # Append a pseudo-entry for ignored dirs if any
+        total = len(filtered) + (1 if ignored_names else 0)
+        for i, entry in enumerate(filtered):
+            is_last = (i == len(filtered) - 1) and not ignored_names
+            conn = "└── " if is_last else "├── "
+            suffix = "/" if entry.is_dir() else ""
+            lines.append(prefix + conn + entry.name + suffix)
+            if entry.is_dir():
+                _walk(entry, prefix + ("    " if is_last else "│   "))
+        if ignored_names:
+            lines.append(prefix + "└── " + f"[{len(ignored_names)} ignored: " + ", ".join(ignored_names) + "]")
+
+    _walk(Path(root), "")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# /plan
+# ---------------------------------------------------------------------------
+
+def handle_plan(task: str, messages: list[dict], state: dict) -> None:
+    cwd = state["cwd"]
+    if not task.strip():
+        console.print("[error]Usage: /plan <task description>[/error]")
+        return
+
+    # Step 1: ask the AI for a plan only
+    plan_prompt = (
+        f"Create a concise numbered step-by-step plan for the following task. "
+        f"Be specific about which files to create or edit and which commands to run. "
+        f"Output the plan only — do NOT start implementing yet.\n\n"
+        f"Task: {task}"
+    )
+    messages.append({"role": "user", "content": plan_prompt})
+    console.print(Panel(
+        f"[bold]Planning:[/bold] {task}",
+        title="/plan", border_style=SAKURA_MUTED,
+    ))
+    plan_reply = stream_response(messages)
+    if not plan_reply:
+        messages.pop()
+        return
+    messages.append({"role": "assistant", "content": plan_reply})
+
+    # Step 2: auto-reprompt to execute
+    exec_prompt = (
+        "Good plan. Now execute it step by step. "
+        "Use <!-- WRITE: path --> markers for any file edits and "
+        "<!-- RUN: cmd --> markers for any shell commands that need to run."
+    )
+    messages.append({"role": "user", "content": exec_prompt})
+    console.print(Panel("[bold]Executing plan\u2026[/bold]", title="/plan", border_style=SAKURA_MUTED))
+    exec_reply = stream_response(messages, cwd)
+    if exec_reply:
+        messages.append({"role": "assistant", "content": exec_reply})
+    else:
+        messages.pop()
+
+    save_session(cwd, messages)
+
+
+# ---------------------------------------------------------------------------
 # /check
 # ---------------------------------------------------------------------------
 
@@ -72,7 +197,6 @@ _CODE_EXTENSIONS: set[str] = {
 
 
 def _extract_function(source: str, func_name: str) -> str | None:
-    # Python
     py = re.compile(rf"^([ \t]*)(async\s+)?def\s+{re.escape(func_name)}\s*\(", re.MULTILINE)
     m  = py.search(source)
     if m:
@@ -87,7 +211,6 @@ def _extract_function(source: str, func_name: str) -> str | None:
             body.append(line)
         while body and not body[-1].strip(): body.pop()
         return "".join(body)
-    # JS/TS brace-matching
     js = re.compile(
         rf"(?:(?:async\s+)?function\s+{re.escape(func_name)}|(?:const|let|var)\s+{re.escape(func_name)}\s*=)",
         re.MULTILINE,
@@ -292,6 +415,24 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
         console.clear()
         console.print("[info]Conversation cleared.[/info]")
 
+    elif name == "/tree":
+        include_ignored = arg.strip() == "-i"
+        tree = _build_rich_tree(cwd, include_ignored=include_ignored)
+        console.print(Panel(tree, title=f"Tree [{_short_cwd(cwd)}]{'  (all dirs)' if include_ignored else ''}",
+                            border_style=SAKURA_DEEP))
+
+    elif name == "/loadtree":
+        include_ignored = arg.strip() == "-i"
+        tree_text = _build_text_tree(cwd, include_ignored=include_ignored)
+        note = "(all directories included)" if include_ignored else "(ignored dirs noted but not expanded)"
+        context_block = (
+            f"Project directory tree for `{cwd}` {note}:\n\n"
+            f"```\n{tree_text}\n```"
+        )
+        state.setdefault("pending_context", []).append(context_block)
+        line_count = tree_text.count("\n") + 1
+        console.print(f"[info]Project tree loaded into context ({line_count} lines). {note}[/info]")
+
     elif name == "/read":
         if not arg:
             console.print("[error]Usage: /read <filepath> | /read -a[/error]")
@@ -369,6 +510,9 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
         else:
             output = run_command_live(arg, cwd)
             messages.append({"role": "user", "content": f"Output of `{arg}`:\n\n```\n{output}\n```"})
+
+    elif name == "/plan":
+        handle_plan(arg, messages, state)
 
     elif name == "/undo":
         tracked = all_tracked_files()

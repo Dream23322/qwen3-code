@@ -31,7 +31,6 @@ def _strip_file_blocks(content: str, gone_set: set[str]) -> str:
 
     content = _READ_BLOCK_RE.sub(_remove_single, content)
 
-    # Handle /read -a bulk blocks: strip sub-blocks for gone files.
     _SUB_RE = re.compile(r"### (?P<rel>[^\n]+)\n```[^\n]*\n.*?```", re.DOTALL)
 
     def _fix_bulk(m: re.Match) -> str:
@@ -60,6 +59,20 @@ def _strip_file_blocks(content: str, gone_set: set[str]) -> str:
     return content.strip()
 
 
+def _file_in_context(fp: str, messages: list[dict], state: dict) -> bool:
+    """Return True if *fp* is currently referenced in any message or pending context."""
+    needle_abs  = str(Path(fp).resolve())
+    needle_name = Path(fp).name
+    haystack = (
+        [m["content"] for m in messages if m.get("content")]
+        + state.get("pending_context", [])
+    )
+    for text in haystack:
+        if fp in text or needle_abs in text or needle_name in text:
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Public handler
 # ---------------------------------------------------------------------------
@@ -75,7 +88,7 @@ def handle_refresh(messages: list[dict], state: dict) -> None:
 
     refreshed: list[tuple[str, str]] = []
     unchanged: list[str]             = []
-    gone: list[str]                  = []
+    gone:      list[str]             = []
 
     for fp in local:
         if not Path(fp).exists():
@@ -102,6 +115,11 @@ def handle_refresh(messages: list[dict], state: dict) -> None:
             unchanged.append(fp)
 
     gone_set = set(gone)
+
+    # Only report gone files that are actually still referenced in context.
+    # Files already pruned on a previous /refresh won't appear in messages
+    # any more, so there's nothing new to report for them.
+    gone_reportable = [fp for fp in gone if _file_in_context(fp, messages, state)]
 
     # ---- Prune messages ---------------------------------------------------
     pruned = 0
@@ -144,10 +162,13 @@ def handle_refresh(messages: list[dict], state: dict) -> None:
         lines.append("[bold]Unchanged[/bold]:")
         for fp in unchanged:
             lines.append(f"  [dim]\u2013[/dim] {fp}")
-    if gone:
+    if gone_reportable:
         lines.append("[bold red]Gone[/bold red] (removed from context):")
-        for fp in gone:
+        for fp in gone_reportable:
             lines.append(f"  [red]\u00d7[/red] {fp}")
+    elif gone and not gone_reportable:
+        # Files are missing on disk but context was already clean — say nothing.
+        pass
     if pruned:
         lines.append(f"\n[dim]Pruned {pruned} stale message(s).[/dim]")
     if not lines:
