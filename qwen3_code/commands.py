@@ -5,6 +5,7 @@ import re
 from collections import defaultdict
 from pathlib import Path
 
+from rich.markup import escape as _esc
 from rich.panel import Panel
 from rich.table import Table
 from rich.tree import Tree as RichTree
@@ -12,7 +13,7 @@ from rich.tree import Tree as RichTree
 from qwen3_code.theme import console, SAKURA, SAKURA_DEEP, SAKURA_DARK, SAKURA_MUTED
 from qwen3_code.settings import CFG, handle_settings, SETTINGS_PATH
 from qwen3_code.utils import (
-    _short_cwd, resolve_path, read_file, run_command_live, spinning_dots,
+    _short_cwd, resolve_path, read_file, run_command_live,
     IGNORED_DIRS, VC_DIR, SESSION_DIR, STREAM_MAX_LINES, SIZE_REDUCTION_THRESHOLD,
 )
 from qwen3_code.session import save_session, load_session, _session_path
@@ -29,12 +30,7 @@ from qwen3_code.renderer import stream_response
 
 def _is_ignored_dir(entry: Path, include_ignored: bool) -> bool:
     """Return True if *entry* (a directory) should be skipped.
-
-    Skips:
-    - Dot-directories (e.g. .git, .venv)
-    - Directories in IGNORED_DIRS by exact name
-    - Any directory that contains a pyvenv.cfg file (custom-named venvs like
-      pyqt_venv, myenv, .env312, etc.) — unless include_ignored is True.
+    Skips dot-dirs, IGNORED_DIRS, and any directory with pyvenv.cfg (custom venvs).
     """
     if include_ignored:
         return False
@@ -42,7 +38,6 @@ def _is_ignored_dir(entry: Path, include_ignored: bool) -> bool:
         return True
     if entry.name in IGNORED_DIRS:
         return True
-    # Custom-named venv: presence of pyvenv.cfg is the canonical marker
     if (entry / "pyvenv.cfg").exists():
         return True
     return False
@@ -63,7 +58,8 @@ def _help_table() -> Table:
         ("/read <file>",         f"load file into context  {D}(saves baseline snapshot){E}"),
         ("/read -a",             f"load ALL files recursively  {D}(skips venv/node_modules etc){E}"),
         ("/tree [-i]",           f"show project file tree  {D}(-i includes ignored dirs){E}"),
-        ("/loadtree [-i] [-d]",  f"inject project tree into AI context  {D}(-i includes ignored, -d adds AI descriptions){E}"),
+        ("/v [-i]",              f"show tree with AI descriptions  {D}(streamed one-by-one){E}"),
+        ("/loadtree [-i] [-d]",  f"inject project tree into AI context  {D}(-i incl. ignored, -d adds AI descriptions){E}"),
         ("/refresh",             f"reload tracked files, prune stale context  {D}(gone files removed){E}"),
         ("/run <cmd>",           "run a shell command  [dim](output streams live)[/dim]"),
         ("/plan <task>",         f"AI plans then auto-executes a task"),
@@ -92,10 +88,98 @@ def _help_table() -> Table:
 # Tree helpers
 # ---------------------------------------------------------------------------
 
-def _build_rich_tree(root: str, include_ignored: bool = False) -> RichTree:
-    """Build a Rich Tree widget of the filesystem under *root*.
-    Tracked files are highlighted; ignored dirs (including custom venvs) are
-    collapsed to a note unless *include_ignored* is True.
+def _collect_files_for_tree(
+    root: str,
+    include_ignored: bool = False,
+) -> list[tuple[str, str]]:
+    """Return (rel_path, abs_path) for every non-ignored file under *root*."""
+    results: list[tuple[str, str]] = []
+    for rdir, dirs, fnames in os.walk(root):
+        rpath = Path(rdir)
+        dirs[:] = [
+            d for d in sorted(dirs)
+            if not _is_ignored_dir(rpath / d, include_ignored)
+        ]
+        for fname in sorted(fnames):
+            if not include_ignored and fname.startswith("."):
+                continue
+            fp = rpath / fname
+            results.append((os.path.relpath(str(fp), root), str(fp)))
+    return results
+
+
+def _generate_file_descriptions_streamed(
+    files: list[tuple[str, str]],
+) -> dict[str, str]:
+    """Ask the model for a description of each file ONE AT A TIME, streaming
+    each token into a live-updating panel so the user can watch.
+
+    Shows only the current file's name + its description as it streams.
+    Returns {rel_path: description}.
+    """
+    import ollama
+    from rich.live import Live
+    from qwen3_code.settings import _model
+
+    result: dict[str, str] = {}
+    subset = files[:40]
+    total  = len(subset)
+
+    for idx, (rel, absp) in enumerate(subset, 1):
+        try:
+            lines   = Path(absp).read_text(encoding="utf-8", errors="replace").splitlines()[:12]
+            snippet = "\n".join(lines)
+        except Exception:
+            snippet = "(unreadable)"
+
+        prompt = (
+            "Give a single short description of this file (8 words max). "
+            "Output ONLY the description — no filename, no prefix, no punctuation at the end.\n\n"
+            f"File: {rel}\n{snippet}"
+        )
+
+        tokens: list[str] = []
+        progress = f"[dim]({idx}/{total})[/dim]"
+
+        def _panel(desc_so_far: str) -> Panel:
+            body = (
+                f"{progress}  [bold]{_esc(rel)}[/bold]\n"
+                f"[dim]{_esc(desc_so_far) if desc_so_far else 'thinking…'}[/dim]"
+            )
+            return Panel(body, title="Describing files", border_style=SAKURA_MUTED)
+
+        try:
+            with Live(
+                _panel(""),
+                console=console,
+                refresh_per_second=20,
+                transient=True,   # erase when done
+            ) as live:
+                for chunk in ollama.chat(
+                    model=_model(),
+                    messages=[{"role": "user", "content": prompt}],
+                    stream=True,
+                ):
+                    token = chunk["message"]["content"]
+                    tokens.append(token)
+                    live.update(_panel("".join(tokens).strip()))
+        except Exception:
+            continue
+
+        desc = "".join(tokens).strip().splitlines()[0].strip()
+        if desc:
+            result[rel] = desc
+
+    return result
+
+
+def _build_rich_tree(
+    root: str,
+    include_ignored: bool = False,
+    descriptions: dict[str, str] | None = None,
+) -> RichTree:
+    """Build a Rich Tree for display.  If *descriptions* is provided,
+    file entries include an AI-generated one-liner.
     """
     tracked = set(all_tracked_files())
 
@@ -115,11 +199,15 @@ def _build_rich_tree(root: str, include_ignored: bool = False) -> RichTree:
             else:
                 if not include_ignored and entry.name.startswith("."):
                     continue
+                rel = os.path.relpath(str(entry), root)
                 is_tracked = str(entry.resolve()) in tracked
+                desc_part  = ""
+                if descriptions and rel in descriptions:
+                    desc_part = f"  [dim]\u2014 {_esc(descriptions[rel])}[/dim]"
                 if is_tracked:
-                    node.add(f"[{SAKURA}]{entry.name}[/{SAKURA}] [dim](tracked)[/dim]")
+                    node.add(f"[{SAKURA}]{entry.name}[/{SAKURA}] [dim](tracked)[/dim]{desc_part}")
                 else:
-                    node.add(f"[dim]{entry.name}[/dim]")
+                    node.add(f"[dim]{entry.name}[/dim]{desc_part}")
         if ignored_names:
             node.add(f"[dim italic]\u2026 {len(ignored_names)} ignored dir(s): {", ".join(ignored_names)}[/dim italic]")
 
@@ -129,90 +217,12 @@ def _build_rich_tree(root: str, include_ignored: bool = False) -> RichTree:
     return tree
 
 
-def _collect_files_for_tree(
-    root: str,
-    include_ignored: bool = False,
-) -> list[tuple[str, str]]:  # [(rel_path, abs_path), ...]
-    """Walk *root* and return (rel_path, abs_path) for every non-ignored file."""
-    results: list[tuple[str, str]] = []
-    for rdir, dirs, fnames in os.walk(root):
-        rpath = Path(rdir)
-        # Prune ignored dirs in-place so os.walk doesn't recurse into them
-        dirs[:] = [
-            d for d in sorted(dirs)
-            if not _is_ignored_dir(rpath / d, include_ignored)
-        ]
-        for fname in sorted(fnames):
-            if not include_ignored and fname.startswith("."):
-                continue
-            fp = rpath / fname
-            results.append((os.path.relpath(str(fp), root), str(fp)))
-    return results
-
-
-def _generate_file_descriptions(
-    files: list[tuple[str, str]],  # [(rel_path, abs_path), ...]
-) -> dict[str, str]:               # rel_path -> one-line description
-    """Ask the AI model to produce a one-line description for each file."""
-    import ollama
-    from qwen3_code.settings import _model
-
-    if not files:
-        return {}
-
-    subset = files[:40]
-    snippets: list[str] = []
-    for rel, absp in subset:
-        try:
-            lines = Path(absp).read_text(encoding="utf-8", errors="replace").splitlines()[:12]
-            snippet = "\n".join(lines)
-        except Exception:
-            snippet = "(unreadable)"
-        snippets.append(f"### {rel}\n{snippet}")
-
-    prompt = (
-        "You are a code assistant. For each file listed below, output EXACTLY one line "
-        "in this format (no extra text, no blank lines between entries):\n"
-        "  FILENAME: short description (8 words max)\n\n"
-        "Only use the exact relative filename as the key.\n\n"
-        + "\n---\n".join(snippets)
-    )
-
-    try:
-        resp = ollama.chat(
-            model=_model(),
-            messages=[{"role": "user", "content": prompt}],
-            stream=False,
-        )
-        raw = resp["message"]["content"]
-    except Exception:
-        return {}
-
-    result: dict[str, str] = {}
-    known_rels  = {rel for rel, _ in subset}
-    known_bases = {os.path.basename(rel): rel for rel, _ in subset}
-    for line in raw.splitlines():
-        line = line.strip().lstrip("-").strip()
-        if ":" not in line:
-            continue
-        colon = line.index(":")
-        key  = line[:colon].strip().strip("`").strip()
-        desc = line[colon + 1:].strip()
-        if not desc:
-            continue
-        if key in known_rels:
-            result[key] = desc
-        elif key in known_bases:
-            result[known_bases[key]] = desc
-    return result
-
-
 def _build_text_tree(
     root: str,
     include_ignored: bool = False,
     descriptions: dict[str, str] | None = None,
 ) -> str:
-    """Build a plain-text tree string suitable for injecting into AI context."""
+    """Build a plain-text tree suitable for injecting into AI context."""
     lines: list[str] = [Path(root).name + "/"]
 
     def _walk(path: Path, prefix: str) -> None:
@@ -338,8 +348,11 @@ def handle_check(arg: str, messages: list[dict], state: dict) -> None:
             if f.is_file() and f.suffix.lower() in _CODE_EXTENSIONS
             and not any(p.startswith(".") for p in f.parts)
             and not any(p in IGNORED_DIRS for p in f.parts)
-            and not any((Path(cwd) / Path(*f.parts[len(Path(cwd).parts):i+1]) / "pyvenv.cfg").exists()
-                        for i in range(len(Path(cwd).parts), len(f.parts)))
+            and not any(
+                _is_ignored_dir(Path(*f.parts[:i+1]), False)
+                for i in range(1, len(f.parts))
+                if Path(*f.parts[:i+1]).is_dir()
+            )
         ]
         if not source_files:
             console.print(f"[info]No source files found in {cwd}.[/info]")
@@ -524,6 +537,20 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
         console.print(Panel(tree, title=f"Tree [{_short_cwd(cwd)}]{'  (all dirs)' if include_ignored else ''}",
                             border_style=SAKURA_DEEP))
 
+    elif name == "/v":
+        # Visual tree with AI-generated descriptions, streamed one file at a time
+        include_ignored = "-i" in arg
+        file_list = _collect_files_for_tree(cwd, include_ignored=include_ignored)
+        if not file_list:
+            console.print("[info]No files found.[/info]")
+        else:
+            console.print(f"[dim]Generating descriptions for {len(file_list[:40])} file(s)\u2026[/dim]")
+            descriptions = _generate_file_descriptions_streamed(file_list)
+            tree = _build_rich_tree(cwd, include_ignored=include_ignored, descriptions=descriptions)
+            title = f"Tree + descriptions [{_short_cwd(cwd)}]"
+            if include_ignored: title += "  (all dirs)"
+            console.print(Panel(tree, title=title, border_style=SAKURA_DEEP))
+
     elif name == "/loadtree":
         flags = arg.lower().split()
         include_ignored   = "-i" in flags
@@ -531,14 +558,11 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
 
         descriptions: dict[str, str] | None = None
         if with_descriptions:
-            console.print("[dim]Generating AI file descriptions\u2026[/dim]")
             file_list = _collect_files_for_tree(cwd, include_ignored=include_ignored)
-            with spinning_dots("Asking AI for descriptions"):
-                descriptions = _generate_file_descriptions(file_list)
-            if descriptions:
+            if file_list:
+                console.print(f"[dim]Generating descriptions for {len(file_list[:40])} file(s)\u2026[/dim]")
+                descriptions = _generate_file_descriptions_streamed(file_list)
                 console.print(f"[dim]Got descriptions for {len(descriptions)} file(s).[/dim]")
-            else:
-                console.print("[dim]Could not generate descriptions (model unavailable?).[/dim]")
 
         tree_text = _build_text_tree(cwd, include_ignored=include_ignored, descriptions=descriptions)
         note_parts = []
