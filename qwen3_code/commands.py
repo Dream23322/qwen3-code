@@ -97,7 +97,7 @@ def handle_learn(arg: str) -> None:
     elif a in ("off", "false", "0", "no"):
         new_val = False
     elif a == "":
-        new_val = not current  # toggle
+        new_val = not current
     else:
         console.print("[error]Usage: /learn  |  /learn on  |  /learn off[/error]")
         return
@@ -630,12 +630,24 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
                     state["cwd"] = str(target)
                     os.chdir(target)
                     new_msgs = load_session(str(target))
-                    messages.clear(); messages.extend(new_msgs)
-                    state["first_message"] = not any(m["role"] != "system" for m in messages)
+                    messages.clear()
+                    messages.extend(new_msgs)
+                    # ---- Reset per-directory state ----
+                    state["pending_context"] = []   # discard staged context from old dir
+                    state["first_message"]   = not any(m["role"] != "system" for m in messages)
                     try: entries = [e.name for e in target.iterdir() if not e.name.startswith(".")][:30]
                     except Exception: entries = []
-                    console.print(Panel(f"[info]Changed to: [bold]{target}[/bold]\nContents: {', '.join(entries) or '(empty)'}[/info]",
-                                        title="cd", border_style=SAKURA))
+                    msg_count = len([m for m in messages if m["role"] != "system"])
+                    session_note = (
+                        f"Resumed session  ({msg_count} message(s))"
+                        if msg_count else "New session"
+                    )
+                    console.print(Panel(
+                        f"[info]Changed to: [bold]{target}[/bold]\n"
+                        f"Contents: {', '.join(entries) or '(empty)'}\n"
+                        f"[dim]{session_note}[/dim][/info]",
+                        title="cd", border_style=SAKURA,
+                    ))
             except FileNotFoundError:
                 console.print(f"[error]Directory not found: {arg}[/error]")
 
