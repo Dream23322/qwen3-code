@@ -16,6 +16,35 @@ def _ctx_limit() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Compact label helpers  (1..10, +1..+10, ++1..)
+# ---------------------------------------------------------------------------
+
+def _item_label(zero_idx: int) -> str:
+    """Convert 0-based list position to compact display label."""
+    if zero_idx < 10:
+        return str(zero_idx + 1)
+    elif zero_idx < 20:
+        return f"+{zero_idx - 9}"
+    else:
+        return f"++{zero_idx - 19}"
+
+
+def _parse_label(label: str, total: int) -> int | None:
+    """Parse a compact label back to a 0-based index.  Returns None if invalid."""
+    label = label.strip()
+    try:
+        if label.startswith("++"):
+            zero_idx = 19 + int(label[2:]) - 1
+        elif label.startswith("+"):
+            zero_idx = 9 + int(label[1:]) - 1
+        else:
+            zero_idx = int(label) - 1
+        return zero_idx if 0 <= zero_idx < total else None
+    except ValueError:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Usage bar
 # ---------------------------------------------------------------------------
 
@@ -24,8 +53,8 @@ def ctx_usage_bar(
     pending: list[str] | None = None,
     bar_width: int = 38,
 ) -> str:
-    limit      = _ctx_limit()
-    used       = count_messages(messages)
+    limit  = _ctx_limit()
+    used   = count_messages(messages)
     if pending:
         used += sum(count_tokens(p) for p in pending)
 
@@ -63,7 +92,6 @@ def ctx_display(messages: list[dict], state: dict | None = None) -> None:
     lines.append(f"[dim]  Token engine : {engine_note}[/dim]")
     lines.append(f"[dim]  Change limit : /settings context_window <tokens>  (current: {limit:,})[/dim]")
 
-    # --- Staged (pending) items ---
     if pending:
         lines.append("")
         lines.append(f"[bold yellow]\u23f3 Staged ({len(pending)} item(s)) \u2014 will be sent with your next message:[/bold yellow]")
@@ -77,7 +105,6 @@ def ctx_display(messages: list[dict], state: dict | None = None) -> None:
                 f"  [dim]({format_tokens(toks)})[/dim]"
             )
 
-    # --- Sent messages ---
     lines.append("")
     if not non_system:
         lines.append("[dim]No sent messages in context.[/dim]")
@@ -86,7 +113,7 @@ def ctx_display(messages: list[dict], state: dict | None = None) -> None:
         for i, m in non_system:
             role    = m["role"]
             content = m.get("content") or ""
-            toks    = count_tokens(content) + 4  # +4 message overhead
+            toks    = count_tokens(content) + 4
             preview = content.replace("\n", " ")[:90]
             if len(content) > 90:
                 preview += "\u2026"
@@ -102,7 +129,6 @@ def ctx_display(messages: list[dict], state: dict | None = None) -> None:
         f"[dim]Total: {format_tokens(used)} tokens"
         f" ({len(non_system)} sent, {len(pending)} staged)[/dim]"
     )
-
     console.print(Panel("\n".join(lines), title="Context", border_style=SAKURA_DEEP))
 
 
@@ -121,6 +147,75 @@ def ctx_clear(messages: list[dict], state: dict | None = None) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Custom selection helpers
+# ---------------------------------------------------------------------------
+
+def _show_removable_list(removable: list[tuple[int, dict]]) -> None:
+    """Print the removable messages with compact labels."""
+    n = len(removable)
+    legend_parts: list[str] = ["1\u20139"]
+    if n > 10: legend_parts.append("+1\u2026+10  (items 11\u201320)")
+    if n > 20: legend_parts.append("++1\u2026  (items 21+)")
+    legend = "  ".join(legend_parts)
+
+    lines = [f"[dim]Label scheme: {legend}[/dim]", ""]
+    for pos, (msg_idx, m) in enumerate(removable):
+        label  = _item_label(pos)
+        role   = m["role"]
+        toks   = count_tokens(m.get("content") or "") + 4
+        preview = (m.get("content") or "").replace("\n", " ")[:80]
+        if len(m.get("content") or "") > 80:
+            preview += "\u2026"
+        role_colour = "cyan" if role == "user" else SAKURA
+        lines.append(
+            f"  [bold]{label:<5}[/bold]"
+            f"  [{role_colour}]{role:<9}[/{role_colour}]"
+            f"  [dim]{_esc(preview)}[/dim]"
+            f"  [dim]({format_tokens(toks)})[/dim]"
+        )
+    console.print(Panel("\n".join(lines), title="Removable messages", border_style=SAKURA_MUTED))
+
+
+def _collect_custom_indices(removable: list[tuple[int, dict]]) -> set[int] | None:
+    """Ask the user to type labels interactively.  Returns a set of *message* indices,
+    or None if cancelled."""
+    n = len(removable)
+    console.print(
+        "[info]Enter labels to remove (one per line). "
+        "Blank line or [bold]done[/bold] when finished. [bold]cancel[/bold] to abort.[/info]"
+    )
+
+    chosen_positions: list[int] = []
+    while True:
+        try:
+            raw = input("  label> ").strip()
+        except (KeyboardInterrupt, EOFError):
+            console.print("[info]Cancelled.[/info]")
+            return None
+        if raw in ("", "done"):
+            break
+        if raw == "cancel":
+            console.print("[info]Cancelled.[/info]")
+            return None
+        pos = _parse_label(raw, n)
+        if pos is None:
+            console.print(f"[error]  '{raw}' is not a valid label (1\u2013{_item_label(n - 1)})[/error]")
+            continue
+        if pos not in chosen_positions:
+            chosen_positions.append(pos)
+            label = _item_label(pos)
+            m     = removable[pos][1]
+            prev  = (m.get("content") or "").replace("\n", " ")[:60]
+            console.print(f"  [green]\u2713 {label}[/green]  [dim]{_esc(prev)}[/dim]")
+
+    if not chosen_positions:
+        console.print("[info]No labels entered \u2014 nothing removed.[/info]")
+        return None
+
+    return {removable[pos][0] for pos in chosen_positions}
+
+
+# ---------------------------------------------------------------------------
 # /context clean
 # ---------------------------------------------------------------------------
 
@@ -133,6 +228,7 @@ def ctx_clean(messages: list[dict], state: dict) -> None:
 
     ctx_display(messages, state)
 
+    # --- Ask AI for suggestions ---
     summary: list[str] = []
     for i, m in non_system:
         toks    = count_tokens(m.get("content") or "") + 4
@@ -176,49 +272,114 @@ def ctx_clean(messages: list[dict], state: dict) -> None:
         return
 
     try:
-        indices: set[int] = set(json.loads(mat.group()))
+        ai_indices: set[int] = set(json.loads(mat.group()))
     except Exception:
         console.print("[error]Invalid JSON from AI.[/error]")
         return
 
     valid    = {i for i, _ in non_system}
     last_six = {i for i, _ in non_system[-6:]}
-    indices  = indices & valid - last_six
+    ai_indices = ai_indices & valid - last_six
 
-    if not indices:
+    # --- Show AI suggestion panel ---
+    if not ai_indices:
         console.print("[info]AI found nothing to remove \u2014 context looks clean.[/info]")
+        # Still offer custom mode so user can manually remove things
+        try:
+            answer = input("Open custom selection anyway? [y/N] ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            return
+        if answer not in ("y", "yes"):
+            return
+        answer = "c"
+    else:
+        ai_preview_lines = ["[bold]AI suggests removing:[/bold]"]
+        saved_ai = 0
+        # Build ordered list matching removable ordering (by position in non_system)
+        for idx in sorted(ai_indices):
+            m_obj        = messages[idx]
+            toks         = count_tokens(m_obj.get("content") or "") + 4
+            saved_ai    += toks
+            prev         = (m_obj.get("content") or "").replace("\n", " ")[:80]
+            ai_preview_lines.append(
+                f"  [dim][msg {idx}] {m_obj['role']} ({format_tokens(toks)}): {_esc(prev)}\u2026[/dim]"
+            )
+        ai_preview_lines.append(
+            f"\n  [green]Will free {format_tokens(saved_ai)} tokens[/green]"
+        )
+        console.print(Panel(
+            "\n".join(ai_preview_lines),
+            title="Context clean \u2014 AI suggestion",
+            border_style=SAKURA_DARK,
+        ))
+
+        try:
+            answer = input(
+                "[y] Accept  [n] Cancel  [c] Custom selection  > "
+            ).strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            console.print("[info]Cancelled.[/info]")
+            return
+
+    # --- Branch on answer ---
+    if answer in ("n", ""):
+        console.print("[info]Cancelled.[/info]")
         return
 
-    preview_lines = ["[bold]AI suggests removing:[/bold]"]
-    saved_tokens  = 0
-    for idx in sorted(indices):
+    if answer in ("y", "yes") and ai_indices:
+        indices_to_remove = ai_indices
+
+    elif answer in ("c", "custom"):
+        # Build removable list: all non-system messages except last 6
+        removable: list[tuple[int, dict]] = [
+            (i, m) for i, m in non_system if i not in last_six
+        ]
+        if not removable:
+            console.print("[info]No messages available to remove (last 6 are protected).[/info]")
+            return
+        _show_removable_list(removable)
+        result = _collect_custom_indices(removable)
+        if result is None:
+            return
+        indices_to_remove = result
+
+    else:
+        console.print("[error]Unrecognised choice.[/error]")
+        return
+
+    if not indices_to_remove:
+        console.print("[info]Nothing to remove.[/info]")
+        return
+
+    # --- Final summary + confirm ---
+    final_lines = ["[bold]Will remove:[/bold]"]
+    saved_total = 0
+    for idx in sorted(indices_to_remove):
         m_obj        = messages[idx]
         toks         = count_tokens(m_obj.get("content") or "") + 4
-        saved_tokens += toks
+        saved_total += toks
         prev         = (m_obj.get("content") or "").replace("\n", " ")[:80]
-        preview_lines.append(
-            f"  [dim][{idx}] {m_obj['role']} ({format_tokens(toks)}): {_esc(prev)}\u2026[/dim]"
+        final_lines.append(
+            f"  [dim][msg {idx}] {m_obj['role']} ({format_tokens(toks)}): {_esc(prev)}\u2026[/dim]"
         )
-    preview_lines.append(
-        f"\n  [green]Will free {format_tokens(saved_tokens)} tokens[/green]"
-    )
-    console.print(Panel("\n".join(preview_lines), title="Context clean", border_style=SAKURA_DARK))
+    final_lines.append(f"\n  [green]Will free {format_tokens(saved_total)} tokens[/green]")
+    console.print(Panel("\n".join(final_lines), title="Confirm removal", border_style=SAKURA_DARK))
 
     try:
-        answer = input("Remove these messages? [y/N] ").strip().lower()
+        confirm = input("Confirm? [y/N] ").strip().lower()
     except (KeyboardInterrupt, EOFError):
         console.print("[info]Cancelled.[/info]")
         return
-    if answer not in ("y", "yes"):
+    if confirm not in ("y", "yes"):
         console.print("[info]Cancelled.[/info]")
         return
 
-    messages[:] = [m for i, m in enumerate(messages) if i not in indices]
+    messages[:] = [m for i, m in enumerate(messages) if i not in indices_to_remove]
 
     from qwen3_code.session import save_session
     save_session(state["cwd"], messages)
     console.print(
-        f"[info]Removed {len(indices)} message(s), freed {format_tokens(saved_tokens)} tokens.[/info]"
+        f"[info]Removed {len(indices_to_remove)} message(s), freed {format_tokens(saved_total)} tokens.[/info]"
     )
     ctx_display(messages, state)
 
