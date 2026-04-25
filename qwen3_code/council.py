@@ -1,9 +1,13 @@
-"""Multi-model council: members answer in parallel, leader picks the best reply.
+"""Multi-model council: members answer one-by-one (or in parallel), leader picks.
 
 Flow
 ----
 1. /council start  -> user picks members and a leader from installed ollama models
-2. While active, every plain message is sent to all members in parallel.
+2. While active, every plain message is sent to all members.
+   - Default mode is SEQUENTIAL: one member runs at a time and is unloaded
+     between turns (keep_alive=0). This is correct on RAM-constrained hosts;
+     ollama would otherwise queue parallel requests waiting for RAM and hang.
+   - /council parallel on  switches to true concurrency for users with enough VRAM.
 3. The leader is asked to choose which response to surface to the user.
 4. The user may keep the leader's pick or switch to any other response.
 5. Only the selected response is appended to the persistent message history;
@@ -32,10 +36,8 @@ from qwen3_code.partial import (
 # ---------------------------------------------------------------------------
 # Tunables
 # ---------------------------------------------------------------------------
-# Wall-clock cap per council member (seconds). After this we give up on that
-# member and keep going with whoever finished. Override per-session by setting
-# state["council"]["timeout"].
 DEFAULT_MEMBER_TIMEOUT_S: float = 180.0
+DEFAULT_PARALLEL:         bool  = False  # sequential is RAM-safe; opt in to parallel
 
 
 # ---------------------------------------------------------------------------
@@ -146,118 +148,82 @@ def _select_leader(member_names: list[str]) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Member queries
+# Member queries  -  with REAL wall-clock timeout (watchdog)
 # ---------------------------------------------------------------------------
 
 def _ask_member(
     model: str,
     messages: list[dict],
     timeout_s: float = DEFAULT_MEMBER_TIMEOUT_S,
+    keep_alive: float | str | None = 0,
 ) -> str:
-    """Synchronously query one ollama model and return its full reply.
+    """Query one ollama model with a hard wall-clock deadline.
 
-    A read-timeout is enforced via a dedicated httpx client. If the model
-    stays silent for ``timeout_s`` seconds, the call raises and we return an
-    error sentinel string starting with '[member error'.
+    The actual HTTP call runs on a worker thread; the calling thread waits on
+    an Event with a timeout. When the deadline passes we forcibly close the
+    underlying httpx client so the worker errors out instead of hanging
+    forever (which is what happens when ollama is queueing the request while
+    waiting for free RAM).
+
+    ``keep_alive=0`` tells ollama to unload the model right after the call,
+    which frees RAM for the next member in sequential mode.
     """
-    chunks: list[str] = []
-    client: OllamaClient = OllamaClient(timeout=timeout_s)
-    try:
-        for chunk in client.chat(model=model, messages=messages, stream=True):
-            chunks.append(chunk["message"]["content"])
-    except Exception as exc:
-        return f"[member error: {exc}]"
+    # Cushion the underlying socket timeout slightly above our wall-clock
+    # budget so the watchdog is the authority, not httpx.
+    client: OllamaClient = OllamaClient(timeout=timeout_s + 30.0)
 
-    return "".join(chunks).strip()
+    result_holder:   list[str]        = [""]
+    finished_event:  threading.Event  = threading.Event()
 
+    def _run() -> None:
+        chunks: list[str] = []
+        try:
+            stream = client.chat(
+                model=model,
+                messages=messages,
+                stream=True,
+                keep_alive=keep_alive,
+            )
+            for chunk in stream:
+                chunks.append(chunk["message"]["content"])
+            result_holder[0] = "".join(chunks).strip()
+        except Exception as exc:
+            result_holder[0] = f"[member error: {exc}]"
+        finally:
+            finished_event.set()
 
-def _gather_responses(
-    members: list[str],
-    messages: list[dict],
-    timeout_s: float = DEFAULT_MEMBER_TIMEOUT_S,
-) -> dict[str, str]:
-    """Run all members concurrently, return {model_name: reply}.
+    worker: threading.Thread = threading.Thread(target=_run, daemon=True)
+    worker.start()
 
-    - Each member has a wall-clock cap of ``timeout_s``; on expiry that member
-      is marked as ``timeout`` and excluded from the leader's judgment.
-    - The user can press Ctrl+C to abandon any still-pending members and
-      proceed with whatever has finished so far.
-    """
-    statuses: dict[str, str]  = {m: "thinking\u2026"     for m in members}
-    starts:   dict[str, float] = {m: time.monotonic()    for m in members}
-    results:  dict[str, str]  = {}
-    lock:     threading.Lock  = threading.Lock()
-    cancelled: dict[str, bool] = {"flag": False}
+    if not finished_event.wait(timeout=timeout_s):
+        # Wall-clock deadline hit. Best-effort tear down the http client to
+        # break the worker out of any read.
+        try:
+            inner: Any = getattr(client, "_client", None)
+            if inner is not None:
+                inner.close()
+        except Exception:
+            pass
+        return f"[member error: timeout after {timeout_s:.0f}s]"
 
-    def _panel() -> Panel:
-        rows: list[str] = []
-        for m in members:
-            elapsed: float = time.monotonic() - starts[m]
-            done: bool     = m in results
-            tag: str       = statuses[m]
-            if done:
-                rows.append(f"  [bold]{m}[/bold]  [dim]{tag}  ({elapsed:.0f}s)[/dim]")
-            else:
-                rows.append(
-                    f"  [bold]{m}[/bold]  [dim]{tag}  ({elapsed:.0f}s / {timeout_s:.0f}s)[/dim]"
-                )
-        rows.append("")
-        rows.append(
-            "[dim]Ctrl+C to abandon pending members and continue with what is done.[/dim]"
-        )
-        return Panel(
-            "\n".join(rows),
-            title="Council members responding",
-            border_style=SAKURA,
-        )
-
-    def _worker(model: str) -> None:
-        reply: str = _ask_member(model, messages, timeout_s)
-        with lock:
-            if cancelled["flag"]:
-                return
-            results[model] = reply
-            if not reply:
-                statuses[model] = "empty"
-            elif reply.startswith("[member error"):
-                low: str = reply.lower()
-                if "timeout" in low or "timed out" in low or "readtimeout" in low:
-                    statuses[model] = "timeout"
-                else:
-                    statuses[model] = "error"
-            else:
-                statuses[model] = f"done ({len(reply)} chars)"
-
-    threads: list[tuple[str, threading.Thread]] = []
-    for m in members:
-        t: threading.Thread = threading.Thread(target=_worker, args=(m,), daemon=True)
-        t.start()
-        threads.append((m, t))
-
-    try:
-        with Live(_panel(), console=console, refresh_per_second=4) as live:
-            while any(t.is_alive() for _, t in threads):
-                for _, t in threads:
-                    t.join(timeout=0.2)
-                live.update(_panel())
-            live.update(_panel())
-    except KeyboardInterrupt:
-        with lock:
-            cancelled["flag"] = True
-            for m in members:
-                if m not in results:
-                    results[m]  = ""
-                    statuses[m] = "skipped"
-        console.print(
-            "[warn]Skipped pending members - continuing with what is done.[/warn]"
-        )
-
-    return results
+    return result_holder[0]
 
 
 # ---------------------------------------------------------------------------
-# Leader judging
+# Status classification
 # ---------------------------------------------------------------------------
+
+def _classify(reply: str) -> str:
+    if not reply:
+        return "empty"
+    if reply.startswith("[member error"):
+        low: str = reply.lower()
+        if "timeout" in low or "timed out" in low or "readtimeout" in low:
+            return "timeout"
+        return "error"
+
+    return f"done ({len(reply)} chars)"
+
 
 def _is_valid_reply(text: str) -> bool:
     s: str = (text or "").strip()
@@ -269,6 +235,135 @@ def _is_valid_reply(text: str) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# Gather responses (sequential or parallel)
+# ---------------------------------------------------------------------------
+
+def _gather_responses(
+    members: list[str],
+    messages: list[dict],
+    timeout_s: float = DEFAULT_MEMBER_TIMEOUT_S,
+    parallel: bool   = DEFAULT_PARALLEL,
+) -> dict[str, str]:
+    """Run all members and return ``{model_name: reply}``.
+
+    Sequential (default): runs one model at a time with ``keep_alive=0`` so
+    each is unloaded before the next is loaded. This is the only safe choice
+    when total model size > available RAM.
+
+    Parallel: dispatches every member at once. Faster on hosts that can
+    actually hold them all simultaneously.
+
+    User can press Ctrl+C to abandon any pending members and continue.
+    """
+    statuses:      dict[str, str]   = {m: "queued" for m in members}
+    starts:        dict[str, float] = {}                # set when each starts
+    elapsed_final: dict[str, float] = {}                # frozen on completion
+    results:       dict[str, str]   = {}
+    lock:          threading.Lock   = threading.Lock()
+    cancelled:     dict[str, bool]  = {"flag": False}
+
+    mode_label: str = "parallel" if parallel else "sequential"
+
+    def _row(m: str) -> str:
+        tag: str = statuses[m]
+        if m in results:
+            secs: float = elapsed_final.get(m, 0.0)
+            return f"  [bold]{m}[/bold]  [dim]{tag}  ({secs:.0f}s)[/dim]"
+        if m in starts:
+            secs = time.monotonic() - starts[m]
+            return (
+                f"  [bold]{m}[/bold]  [dim]{tag}  "
+                f"({secs:.0f}s / {timeout_s:.0f}s)[/dim]"
+            )
+        return f"  [bold]{m}[/bold]  [dim]{tag}[/dim]"
+
+    def _panel() -> Panel:
+        rows: list[str] = [_row(m) for m in members]
+        rows.append("")
+        rows.append(
+            f"[dim]Mode: {mode_label}.  "
+            "Ctrl+C to abandon pending members and continue with what is done.[/dim]"
+        )
+        return Panel(
+            "\n".join(rows),
+            title="Council members responding",
+            border_style=SAKURA,
+        )
+
+    def _record(model: str, reply: str, started_at: float) -> None:
+        with lock:
+            results[model]       = reply
+            elapsed_final[model] = time.monotonic() - started_at
+            statuses[model]      = _classify(reply)
+
+    def _runner_sequential() -> None:
+        for m in members:
+            if cancelled["flag"]:
+                with lock:
+                    if m not in results:
+                        results[m]       = ""
+                        elapsed_final[m] = 0.0
+                        statuses[m]      = "skipped"
+                continue
+            with lock:
+                starts[m]   = time.monotonic()
+                statuses[m] = "thinking\u2026"
+            started_at: float = starts[m]
+            reply: str = _ask_member(m, messages, timeout_s, keep_alive=0)
+            _record(m, reply, started_at)
+
+    def _runner_parallel_one(model: str) -> None:
+        with lock:
+            starts[model]   = time.monotonic()
+            statuses[model] = "thinking\u2026"
+        started_at: float = starts[model]
+        reply: str = _ask_member(model, messages, timeout_s, keep_alive=None)
+        _record(model, reply, started_at)
+
+    workers: list[threading.Thread] = []
+    if parallel:
+        for m in members:
+            t: threading.Thread = threading.Thread(
+                target=_runner_parallel_one, args=(m,), daemon=True,
+            )
+            t.start()
+            workers.append(t)
+    else:
+        seq_thread: threading.Thread = threading.Thread(
+            target=_runner_sequential, daemon=True,
+        )
+        seq_thread.start()
+        workers.append(seq_thread)
+
+    try:
+        with Live(_panel(), console=console, refresh_per_second=4) as live:
+            while any(t.is_alive() for t in workers):
+                for t in workers:
+                    t.join(timeout=0.2)
+                live.update(_panel())
+            live.update(_panel())
+    except KeyboardInterrupt:
+        with lock:
+            cancelled["flag"] = True
+            for m in members:
+                if m not in results:
+                    results[m]       = ""
+                    elapsed_final[m] = (
+                        time.monotonic() - starts[m] if m in starts else 0.0
+                    )
+                    statuses[m]      = "skipped"
+        console.print(
+            "[warn]Skipped pending members - continuing with what is done.[/warn]"
+        )
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Leader judging
+# ---------------------------------------------------------------------------
+
 def _ask_leader_choice(
     leader: str,
     user_prompt: str,
@@ -276,7 +371,6 @@ def _ask_leader_choice(
     responses: dict[str, str],
     timeout_s: float = DEFAULT_MEMBER_TIMEOUT_S,
 ) -> int:
-    # Only consider members that actually produced a usable reply.
     valid: list[tuple[int, str]] = [
         (i, m) for i, m in enumerate(member_names)
         if _is_valid_reply(responses.get(m, ""))
@@ -303,6 +397,7 @@ def _ask_leader_choice(
         leader,
         [{"role": "user", "content": judge_prompt}],
         timeout_s,
+        keep_alive=0,
     )
     match: re.Match[str] | None = re.search(r"\d+", raw or "")
     if not match:
@@ -366,9 +461,7 @@ def _review_loop(
                 continue
             if 0 <= n < len(member_names):
                 if not _is_valid_reply(responses.get(member_names[n], "")):
-                    console.print(
-                        "[error]That member has no usable reply.[/error]"
-                    )
+                    console.print("[error]That member has no usable reply.[/error]")
                     continue
                 chosen_idx = n
                 console.print(
@@ -415,30 +508,39 @@ def run_council_round(
     Discarded responses are NEVER added to ``messages``.
     Returns the chosen reply text (empty string on total failure).
     """
-    members: list[str] = council["members"]
-    leader:  str       = council["leader"]
-    timeout_s: float   = float(council.get("timeout", DEFAULT_MEMBER_TIMEOUT_S))
+    members:    list[str] = council["members"]
+    leader:     str       = council["leader"]
+    timeout_s:  float     = float(council.get("timeout", DEFAULT_MEMBER_TIMEOUT_S))
+    parallel:   bool      = bool(council.get("parallel", DEFAULT_PARALLEL))
 
     request_messages: list[dict] = messages + [{"role": "user", "content": user_prompt}]
 
     console.print(Panel(
         f"[bold]Members:[/bold] {', '.join(members)}\n"
         f"[bold]Leader:[/bold]  {leader}\n"
+        f"[bold]Mode:[/bold]    {'parallel' if parallel else 'sequential (RAM-safe)'}\n"
         f"[bold]Timeout:[/bold] {timeout_s:.0f}s per member",
         title="Council session", border_style=SAKURA_MUTED,
     ))
 
-    responses: dict[str, str] = _gather_responses(members, request_messages, timeout_s)
+    responses: dict[str, str] = _gather_responses(
+        members, request_messages, timeout_s, parallel,
+    )
 
-    valid_members: list[str] = [m for m in members if _is_valid_reply(responses.get(m, ""))]
+    valid_members: list[str] = [
+        m for m in members if _is_valid_reply(responses.get(m, ""))
+    ]
     if not valid_members:
         console.print(
             "[error]No member produced a usable response. "
-            "Try /council timeout <seconds> or drop the slow member.[/error]"
+            "Try /council timeout <seconds>, drop the slow member, "
+            "or /council parallel off.[/error]"
         )
         return ""
 
-    leader_pick: int = _ask_leader_choice(leader, user_prompt, members, responses, timeout_s)
+    leader_pick: int = _ask_leader_choice(
+        leader, user_prompt, members, responses, timeout_s,
+    )
     chosen_member: str = members[leader_pick]
     console.print(Panel(
         f"[bold]Leader[/bold] [{SAKURA}]{leader}[/{SAKURA}] picked response "
@@ -463,8 +565,6 @@ def run_council_round(
     messages.append({"role": "user",      "content": user_prompt})
     messages.append({"role": "assistant", "content": chosen_text})
 
-    # Apply any tool markers that may be present in the chosen reply, so the
-    # council behaves like the normal chat loop for file edits and commands.
     apply_file_writes(chosen_text)
     apply_file_inserts(chosen_text, cwd)
     apply_command_runs(chosen_text, cwd, messages)
@@ -498,18 +598,21 @@ def _start_council(state: dict) -> None:
     leader:     str       = members[leader_idx]
 
     state["council"] = {
-        "members": members,
-        "leader":  leader,
-        "timeout": DEFAULT_MEMBER_TIMEOUT_S,
+        "members":  members,
+        "leader":   leader,
+        "timeout":  DEFAULT_MEMBER_TIMEOUT_S,
+        "parallel": DEFAULT_PARALLEL,
     }
 
     console.print(Panel(
         f"[bold]Members:[/bold] {', '.join(members)}\n"
         f"[bold]Leader:[/bold]  {leader}\n"
-        f"[bold]Timeout:[/bold] {DEFAULT_MEMBER_TIMEOUT_S:.0f}s per member "
-        "([dim]/council timeout <seconds> to change[/dim])\n\n"
-        "[dim]Council is now active. Plain messages are routed through the council.\n"
-        "End the session with [bold]/council end[/bold].[/dim]",
+        f"[bold]Mode:[/bold]    {'parallel' if DEFAULT_PARALLEL else 'sequential (RAM-safe)'}\n"
+        f"[bold]Timeout:[/bold] {DEFAULT_MEMBER_TIMEOUT_S:.0f}s per member\n\n"
+        "[dim]/council parallel on|off  -  toggle concurrency.\n"
+        "/council timeout <seconds>  -  change per-member timeout.\n"
+        "Plain messages are routed through the council; "
+        "end with [bold]/council end[/bold].[/dim]",
         title="Council started", border_style=SAKURA_DEEP,
     ))
 
@@ -532,9 +635,11 @@ def _status_council(state: dict) -> None:
             "[info]No active council. Start one with [bold]/council start[/bold].[/info]"
         )
         return
+    parallel: bool = bool(c.get("parallel", DEFAULT_PARALLEL))
     console.print(Panel(
         f"[bold]Members:[/bold] {', '.join(c['members'])}\n"
         f"[bold]Leader:[/bold]  {c['leader']}\n"
+        f"[bold]Mode:[/bold]    {'parallel' if parallel else 'sequential (RAM-safe)'}\n"
         f"[bold]Timeout:[/bold] {float(c.get('timeout', DEFAULT_MEMBER_TIMEOUT_S)):.0f}s per member",
         title="Council status", border_style=SAKURA,
     ))
@@ -559,10 +664,32 @@ def _set_timeout(arg: str, state: dict) -> None:
     console.print(f"[info]Council per-member timeout set to {secs:.0f}s.[/info]")
 
 
+def _set_parallel(arg: str, state: dict) -> None:
+    c: dict | None = state.get("council")
+    if not c:
+        console.print(
+            "[info]No active council. Start one with [bold]/council start[/bold].[/info]"
+        )
+        return
+    val: str = arg.strip().lower()
+    enabled: bool
+    if val in ("on", "true", "yes", "1"):
+        enabled = True
+    elif val in ("off", "false", "no", "0"):
+        enabled = False
+    else:
+        console.print("[error]Usage: /council parallel on|off[/error]")
+        return
+    c["parallel"] = enabled
+    console.print(
+        f"[info]Council mode: {'parallel' if enabled else 'sequential (RAM-safe)'}.[/info]"
+    )
+
+
 def handle_council(arg: str, state: dict) -> None:
     raw: str = arg.strip()
     parts: list[str] = raw.split(None, 1)
-    sub: str  = parts[0].lower() if parts else ""
+    sub:  str = parts[0].lower() if parts else ""
     rest: str = parts[1] if len(parts) > 1 else ""
 
     if sub in ("", "status"):
@@ -572,9 +699,11 @@ def handle_council(arg: str, state: dict) -> None:
     if sub == "end":
         _end_council(state);    return
     if sub == "timeout":
-        _set_timeout(rest, state); return
+        _set_timeout(rest, state);  return
+    if sub == "parallel":
+        _set_parallel(rest, state); return
 
     console.print(
         "[error]Usage: /council start  |  /council end  |  /council status  |  "
-        "/council timeout <seconds>[/error]"
+        "/council timeout <seconds>  |  /council parallel on|off[/error]"
     )
