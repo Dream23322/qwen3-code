@@ -20,7 +20,7 @@ except ImportError:
 SLASH_COMMANDS: list[str] = [
     "/cd", "/read", "/refresh", "/run", "/undo", "/redo", "/files",
     "/clear", "/check", "/stackview", "/settings", "/history", "/help",
-    "/commit", "/log", "/checkout",
+    "/commit", "/log", "/checkout", "/council",
     "/tree", "/loadtree", "/plan", "/v",
     "/context", "/learn",
     "/quit", "/exit", "/q",
@@ -36,6 +36,7 @@ CMD_SUBARGS: dict[str, list[str]] = {
     "/v":         ["-i"],
     "/context":   ["display", "clear", "clean"],
     "/learn":     ["on", "off"],
+    "/council":   ["start", "end", "status", "timeout", "parallel"]
 }
 
 FILE_COMMANDS: set[str] = {"/read", "/check", "/undo", "/redo", "/files",
