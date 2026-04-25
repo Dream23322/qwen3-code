@@ -27,6 +27,7 @@ from qwen3_code.vc import (
 from qwen3_code.refresh import handle_refresh
 from qwen3_code.renderer import stream_response
 from qwen3_code.context_tools import handle_context
+from qwen3_code.council import handle_council
 
 # ---------------------------------------------------------------------------
 # Description cache
@@ -149,6 +150,7 @@ def _help_table() -> Table:
         ("/refresh",              f"reload tracked files, prune stale context  {D}(gone files removed){E}"),
         ("/run <cmd>",            "run a shell command  [dim](output streams live)[/dim]"),
         ("/plan <task>",          f"AI plans then auto-executes a task"),
+        ("/council [start|end]",  f"multi-model deliberation  {D}members answer, leader picks{E}"),
         ("/learn [on|off]",       f"beginner tutorial mode{learn_status}"),
         ("/clear",                "clear conversation history"),
         ("/check <target>",       f"AI code review  {D}ALL | file | file:func{E}"),
@@ -715,6 +717,9 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
 
     elif name == "/context":
         handle_context(arg, messages, state)
+
+    elif name == "/council":
+        handle_council(arg, state)
 
     elif name == "/read":
         if not arg:

@@ -19,6 +19,7 @@ Package layout
     renderer.py   - streaming response renderer (ollama chat loop)
     commands.py   - all /slash command handlers and dispatcher
     context_tools.py - /context subcommands and usage bar
+    council.py    - /council multi-model deliberation (members + leader)
 """
 
 import os
@@ -32,6 +33,7 @@ from qwen3_code.session import load_session, save_session, load_last_cwd
 from qwen3_code.completer import inline_prompt, enable_windows_vt
 from qwen3_code.commands import handle_slash_command
 from qwen3_code.renderer import stream_response
+from qwen3_code.council import run_council_round
 
 
 def main() -> None:
@@ -113,6 +115,13 @@ def main() -> None:
         if pending:
             content = "\n\n".join(pending) + "\n\n" + content
             state["pending_context"] = []
+
+        # ---- Council mode: route plain messages through the council --------
+        if state.get("council"):
+            council_reply = run_council_round(state["council"], messages, content, cwd)
+            if council_reply:
+                save_session(state["cwd"], messages)
+            continue
 
         messages.append({"role": "user", "content": content})
         reply = stream_response(messages, cwd)
