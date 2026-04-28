@@ -69,6 +69,49 @@ def _desc_context_block(cwd: str, descriptions: dict[str, str]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# File-description filters
+# ---------------------------------------------------------------------------
+
+# Binary / generated / lockfile-ish extensions where a one-line AI description
+# would be useless and just waste a model call.
+_DESC_SKIP_EXTS: set[str] = {
+    ".svg", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".bmp", ".tiff",
+    ".woff", ".woff2", ".ttf", ".eot", ".otf",
+    ".pdf", ".zip", ".tar", ".gz", ".tgz", ".7z", ".rar",
+    ".mp3", ".mp4", ".mov", ".avi", ".webm", ".wav", ".flac",
+    ".so", ".dll", ".dylib", ".o", ".a", ".class", ".jar",
+    ".lock", ".bin", ".dat", ".db", ".sqlite", ".sqlite3",
+}
+
+_DESC_SKIP_NAMES: set[str] = {
+    "package-lock.json", "pnpm-lock.yaml", "yarn.lock",
+    "poetry.lock", "Cargo.lock", "Pipfile.lock", "uv.lock",
+    "composer.lock", "Gemfile.lock",
+}
+
+# Files larger than this are skipped (too big to summarise meaningfully
+# from the first dozen lines, and slow to read repeatedly).
+_DESC_MAX_BYTES: int = 200_000
+
+
+def _should_describe(rel: str, absp: str) -> bool:
+    p: Path = Path(absp)
+    if p.name in _DESC_SKIP_NAMES:
+        return False
+    if p.suffix.lower() in _DESC_SKIP_EXTS:
+        return False
+    if rel.endswith(".min.js") or rel.endswith(".min.css"):
+        return False
+    try:
+        if p.stat().st_size > _DESC_MAX_BYTES:
+            return False
+    except Exception:
+        return False
+
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -200,62 +243,106 @@ def _generate_file_descriptions_streamed(
     files: list[tuple[str, str]],
     cwd: str = "",
 ) -> dict[str, str]:
+    """Describe every textual file under ``files`` (no hard cap).
+
+    Behaviour:
+      - Filters out binary / lockfile / oversized files up-front.
+      - Accumulates into the existing description cache (so re-runs only
+        re-describe what's missing or changed; nothing previously cached is
+        thrown away).
+      - Persists after every successful description, so Ctrl+C keeps every
+        description finished so far.
+    """
     import ollama
     from rich.live import Live
     from qwen3_code.settings import _model
 
-    result: dict[str, str] = {}
-    subset = files[:40]
-    total  = len(subset)
+    # Start from whatever's already cached so partial runs accumulate.
+    result: dict[str, str] = dict(_load_desc_cache(cwd) or {}) if cwd else {}
 
-    for idx, (rel, absp) in enumerate(subset, 1):
-        try:
-            lines   = Path(absp).read_text(encoding="utf-8", errors="replace").splitlines()[:12]
-            snippet = "\n".join(lines)
-        except Exception:
-            snippet = "(unreadable)"
+    targets:    list[tuple[str, str]] = [
+        (rel, absp) for rel, absp in files if _should_describe(rel, absp)
+    ]
+    skipped_n:  int  = len(files) - len(targets)
+    total:      int  = len(targets)
+    interrupted: bool = False
 
-        prompt = (
-            "Give a single short description of this file (8 words max). "
-            "Output ONLY the description \u2014 no filename, no prefix, no punctuation at the end.\n\n"
-            f"File: {rel}\n{snippet}"
+    if skipped_n:
+        console.print(
+            f"[dim]Skipping {skipped_n} non-textual / oversized file(s).[/dim]"
         )
+    if not targets:
+        return result
 
-        tokens: list[str] = []
-        progress = f"[dim]({idx}/{total})[/dim]"
+    try:
+        for idx, (rel, absp) in enumerate(targets, 1):
+            try:
+                lines:   list[str] = Path(absp).read_text(
+                    encoding="utf-8", errors="replace",
+                ).splitlines()[:12]
+                snippet: str       = "\n".join(lines)
+            except Exception:
+                continue
 
-        def _panel(desc_so_far: str, _rel: str = rel, _prog: str = progress) -> Panel:
-            body = (
-                f"{_prog}  [bold]{_esc(_rel)}[/bold]\n"
-                f"[dim]{_esc(desc_so_far) if desc_so_far else 'thinking\u2026'}[/dim]"
+            prompt: str = (
+                "Give a single short description of this file (8 words max). "
+                "Output ONLY the description \u2014 no filename, no prefix, no punctuation at the end.\n\n"
+                f"File: {rel}\n{snippet}"
             )
-            return Panel(body, title="Describing files", border_style=SAKURA_MUTED)
 
-        try:
-            with Live(
-                _panel(""),
-                console=console,
-                refresh_per_second=20,
-                transient=True,
-            ) as live:
-                for chunk in ollama.chat(
-                    model=_model(),
-                    messages=[{"role": "user", "content": prompt}],
-                    stream=True,
-                ):
-                    token = chunk["message"]["content"]
-                    tokens.append(token)
-                    live.update(_panel("".join(tokens).strip()))
-        except Exception:
-            continue
+            tokens:   list[str] = []
+            progress: str       = f"[dim]({idx}/{total})[/dim]"
 
-        desc = "".join(tokens).strip().splitlines()[0].strip()
-        if desc:
-            result[rel] = desc
+            def _panel(desc_so_far: str, _rel: str = rel, _prog: str = progress) -> Panel:
+                body: str = (
+                    f"{_prog}  [bold]{_esc(_rel)}[/bold]\n"
+                    f"[dim]{_esc(desc_so_far) if desc_so_far else 'thinking\u2026'}[/dim]\n\n"
+                    f"[dim]Ctrl+C to stop and keep partial descriptions.[/dim]"
+                )
+                return Panel(body, title="Describing files", border_style=SAKURA_MUTED)
+
+            try:
+                with Live(
+                    _panel(""),
+                    console=console,
+                    refresh_per_second=20,
+                    transient=True,
+                ) as live:
+                    for chunk in ollama.chat(
+                        model=_model(),
+                        messages=[{"role": "user", "content": prompt}],
+                        stream=True,
+                    ):
+                        token: str = chunk["message"]["content"]
+                        tokens.append(token)
+                        live.update(_panel("".join(tokens).strip()))
+            except KeyboardInterrupt:
+                interrupted = True
+                break
+            except Exception:
+                continue
+
+            desc: str = (
+                "".join(tokens).strip().splitlines()[0].strip() if tokens else ""
+            )
+            if desc:
+                result[rel] = desc
+                # Persist after every successful description so a crash or
+                # Ctrl+C never throws progress away.
+                if cwd:
+                    _save_desc_cache(cwd, result)
+    except KeyboardInterrupt:
+        interrupted = True
 
     if cwd and result:
         _save_desc_cache(cwd, result)
-        console.print(f"[dim]Descriptions cached ({len(result)} files).[/dim]")
+        if interrupted:
+            console.print(
+                f"[dim]Interrupted. Cached {len(result)} description(s) so far. "
+                f"Re-run [bold]/v[/bold] to fill in the rest.[/dim]"
+            )
+        else:
+            console.print(f"[dim]Descriptions cached ({len(result)} files).[/dim]")
 
     return result
 
@@ -673,7 +760,7 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
         if not file_list:
             console.print("[info]No files found.[/info]")
         else:
-            console.print(f"[dim]Generating descriptions for {len(file_list[:40])} file(s)\u2026[/dim]")
+            console.print(f"[dim]Generating descriptions for up to {len(file_list)} file(s)\u2026[/dim]")
             descriptions = _generate_file_descriptions_streamed(file_list, cwd=cwd)
             tree = _build_rich_tree(cwd, include_ignored=include_ignored, descriptions=descriptions)
             title = f"Tree + descriptions [{_short_cwd(cwd)}]"
@@ -698,7 +785,7 @@ def handle_slash_command(cmd: str, messages: list[dict], state: dict) -> bool:
             else:
                 file_list = _collect_files_for_tree(cwd, include_ignored=include_ignored)
                 if file_list:
-                    console.print(f"[dim]Generating descriptions for {len(file_list[:40])} file(s)\u2026[/dim]")
+                    console.print(f"[dim]Generating descriptions for up to {len(file_list)} file(s)\u2026[/dim]")
                     descriptions = _generate_file_descriptions_streamed(file_list, cwd=cwd)
                     console.print(f"[dim]Got descriptions for {len(descriptions)} file(s).[/dim]")
 
