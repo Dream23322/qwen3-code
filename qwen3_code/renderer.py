@@ -18,7 +18,7 @@ from qwen3_code.settings import _model, _assistant_name, _learn_mode
 from qwen3_code.utils import _phys_rows, STREAM_MAX_LINES, PARTIAL_REPROMPT, resolve_path, read_file
 from qwen3_code.partial import (
     reply_has_partial_write, apply_file_writes, apply_file_inserts, apply_command_runs,
-    has_read_requests, collect_read_requests, has_inserts,
+    has_read_requests, collect_read_requests, has_inserts, parse_attrs,
 )
 
 # ---------------------------------------------------------------------------
@@ -93,37 +93,97 @@ def _watch_for_cancel(cancel_event: threading.Event) -> None:
 # Render
 # ---------------------------------------------------------------------------
 
+# Match any rendered "block": new <q*> tags first, then legacy fences last.
+_BLOCK_RE: re.Pattern = re.compile(
+    r"<qwrite\s+(?P<wattrs>[^>]*?)>\s*\n?(?P<wcode>.*?)</qwrite>"
+    r"|<qinsert\s+(?P<iattrs>[^>]*?)>\s*\n?(?P<icode>.*?)</qinsert>"
+    r"|<qcode(?:\s+(?P<cattrs>[^>]*?))?\s*>\s*\n?(?P<ccode>.*?)</qcode>"
+    r"|(?P<legacy>```(?:\w+)?\n.*?```)",
+    re.DOTALL | re.IGNORECASE,
+)
+
+_LEGACY_FENCE_INNER: re.Pattern = re.compile(r"```(\w+)?\n(.*?)```", re.DOTALL)
+
+
+def _render_prose_segment(part: str) -> None:
+    """Strip action markers from *part* and render whatever prose remains."""
+    cleaned = re.sub(r"<!--\s*WRITE:[^>]+-->",  "", part)
+    cleaned = re.sub(r"<!--\s*INSERT:[^>]+-->", "", cleaned)
+    cleaned = re.sub(r"<!--\s*READ:[^>]+-->",   "", cleaned)
+    cleaned = re.sub(r"<!--\s*RUN:[^>]+-->",    "", cleaned)
+    cleaned = re.sub(r"<qread\s+[^/>]*?/\s*>",  "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(
+        r"<qrun\s*>.*?</qrun>", "", cleaned,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    cleaned = cleaned.strip()
+    if cleaned:
+        console.print(Markdown(cleaned))
+
+
+def _code_panel(code: str, lang: str, title: str, border: str) -> Panel:
+    return Panel(
+        Syntax(code, lang or "text", theme="dracula", line_numbers=True),
+        title=title,
+        border_style=border,
+    )
+
+
 def render_response(text: str) -> None:
     """Render a completed AI response: prose as Markdown, code as Syntax panels."""
-    _CODE_BLOCK_RE = re.compile(r"(```(?:\w+)?\n.*?```)", re.DOTALL)
-    for part in _CODE_BLOCK_RE.split(text):
-        if not part:
-            continue
-        if part.startswith("```") and part.endswith("```"):
-            m = re.match(r"```(\w+)?\n(.*?)```", part, re.DOTALL)
-            if not m:
-                console.print(Markdown(part))
-                continue
-            lang, code    = m.group(1) or "text", m.group(2)
-            block_start   = text.find(part)
-            prefix        = text[max(0, block_start - 200): block_start]
-            wm            = re.search(r"<!--\s*WRITE:\s*([^\s>]+)\s*-->", prefix)
-            im            = re.search(r"<!--\s*INSERT:\s*([^\s>:]+):(\d+)\s*-->", prefix)
-            if wm:
-                title, border = f"Written to {wm.group(1)}", SAKURA_DEEP
-            elif im:
-                title, border = f"Insert into {im.group(1)} (before line {im.group(2)})", SAKURA
-            else:
-                title, border = f"Code ({lang})", SAKURA
-            console.print(Panel(Syntax(code, lang, theme="dracula", line_numbers=True),
-                                title=title, border_style=border))
+    last_end: int = 0
+    for m in _BLOCK_RE.finditer(text):
+        if m.start() > last_end:
+            _render_prose_segment(text[last_end:m.start()])
+
+        if m.group("wcode") is not None:
+            attrs = parse_attrs(m.group("wattrs"))
+            path  = attrs.get("path", "").strip() or "(unknown)"
+            lang  = attrs.get("lang", "").strip() or "text"
+            console.print(_code_panel(
+                m.group("wcode"), lang,
+                f"Written to {path}", SAKURA_DEEP,
+            ))
+        elif m.group("icode") is not None:
+            attrs = parse_attrs(m.group("iattrs"))
+            path  = attrs.get("path", "").strip() or "(unknown)"
+            line  = attrs.get("line", "").strip() or "?"
+            lang  = attrs.get("lang", "").strip() or "text"
+            console.print(_code_panel(
+                m.group("icode"), lang,
+                f"Insert into {path} (before line {line})", SAKURA,
+            ))
+        elif m.group("ccode") is not None:
+            attrs = parse_attrs(m.group("cattrs") or "")
+            lang  = attrs.get("lang", "").strip() or "text"
+            console.print(_code_panel(
+                m.group("ccode"), lang,
+                f"Code ({lang})", SAKURA,
+            ))
         else:
-            cleaned = re.sub(r"<!--\s*WRITE:[^>]+-->", "", part)
-            cleaned = re.sub(r"<!--\s*INSERT:[^>]+-->", "", cleaned)
-            cleaned = re.sub(r"<!--\s*READ:[^>]+-->", "", cleaned)
-            cleaned = re.sub(r"<!--\s*RUN:[^>]+-->", "", cleaned).strip()
-            if cleaned:
-                console.print(Markdown(cleaned))
+            block = m.group("legacy") or ""
+            inner = _LEGACY_FENCE_INNER.match(block)
+            if not inner:
+                console.print(Markdown(block))
+            else:
+                lang = inner.group(1) or "text"
+                code = inner.group(2)
+                prefix = text[max(0, m.start() - 200): m.start()]
+                wm = re.search(r"<!--\s*WRITE:\s*([^\s>]+)\s*-->", prefix)
+                im = re.search(r"<!--\s*INSERT:\s*([^\s>:]+):(\d+)\s*-->", prefix)
+                if wm:
+                    title, border = f"Written to {wm.group(1)}", SAKURA_DEEP
+                elif im:
+                    title  = f"Insert into {im.group(1)} (before line {im.group(2)})"
+                    border = SAKURA
+                else:
+                    title, border = f"Code ({lang})", SAKURA
+                console.print(_code_panel(code, lang, title, border))
+
+        last_end = m.end()
+
+    if last_end < len(text):
+        _render_prose_segment(text[last_end:])
 
 
 # ---------------------------------------------------------------------------
@@ -232,9 +292,10 @@ def stream_response(messages: list[dict], cwd: str = "") -> str:
     Handles:
     - Ctrl+D cancel
     - Partial-write detection and reprompt
-    - <!-- READ: path --> markers
-    - <!-- WRITE: path --> markers
-    - <!-- INSERT: path:LINE --> markers (with optional syntax verification)
+    - <qread path="..." /> markers (and legacy <!-- READ: --> markers)
+    - <qwrite path="..."> markers (and legacy <!-- WRITE: --> markers)
+    - <qinsert path="..." line="N"> markers (and legacy <!-- INSERT: --> markers)
+    - <qrun>cmd</qrun> markers (and legacy <!-- RUN: --> markers)
     - Learn mode (prepends beginner-friendly system message)
     """
     effective = _effective_messages(messages)
@@ -277,7 +338,8 @@ def stream_response(messages: list[dict], cwd: str = "") -> str:
             resolved = resolve_path(rp, cwd) if cwd else rp
             content  = read_file(resolved)
             file_blocks.append(
-                f"Here is the content of `{resolved}`:\n\n```\n{content}\n```"
+                f"Here is the content of `{resolved}`:\n\n"
+                f"<qcode lang=\"text\">\n{content}\n</qcode>"
             )
         if not file_blocks:
             break
