@@ -17,6 +17,7 @@ DEFAULT_SETTINGS: dict = {
     "context_window":         128000,
     "insert_verify":          True,
     "learn_mode":             False,
+    "safe_mode":              True,
 }
 
 SETTINGS_HELP: dict[str, str] = {
@@ -27,6 +28,7 @@ SETTINGS_HELP: dict[str, str] = {
     "context_window":         "Token limit for your model (e.g. 128000, 1000000) \u2014 used by /context bar",
     "insert_verify":          "true/false  \u2014 show syntax check + diff preview before applying INSERT markers",
     "learn_mode":             "true/false  \u2014 beginner tutorial mode: AI explains concepts step-by-step (toggle with /learn)",
+    "safe_mode":              "true/false  \u2014 disable user verification and other security measures (not recommended)",
 }
 
 
@@ -60,6 +62,7 @@ def _app_name()       -> str:  return CFG["app_name"]
 def _assistant_name() -> str:  return CFG["assistant_name"]
 def _context_window() -> int:  return int(CFG.get("context_window", 128_000))
 def _learn_mode()     -> bool: return bool(CFG.get("learn_mode", False))
+def _safe_mode()      -> bool: return bool(CFG.get("safe_mode", True))
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +112,11 @@ def handle_settings(arg: str) -> None:
         value = raw
 
     old = CFG[key]
+    
+    # Check for wanting to set default value
+    if value == "default":
+        value = DEFAULT_SETTINGS.get(key)
+
     CFG[key] = value
     save_settings(CFG)
     console.print(f"[info][bold cyan]{key}[/bold cyan]: [dim]{old}[/dim] \u2192 [bold]{value}[/bold]  saved[/info]")

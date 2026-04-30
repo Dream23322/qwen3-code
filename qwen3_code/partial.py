@@ -27,6 +27,7 @@ from rich.panel import Panel
 from qwen3_code.theme import console, SAKURA, SAKURA_DEEP, SAKURA_DARK, SAKURA_MUTED
 from qwen3_code.utils import ConsoleSession
 from qwen3_code.vc import write_file_with_vc
+from qwen3_code.settings import _safe_mode
 
 # ---------------------------------------------------------------------------
 # Partial-write detection (truncation markers inside a write payload)
@@ -386,7 +387,11 @@ def apply_command_runs(reply: str, cwd: str, messages: list[dict]) -> None:
             title="Permission required", border_style=SAKURA_DARK,
         ))
         try:
-            answer = input("Allow? [y/N] ").strip().lower()
+            answer
+            if _safe_mode():
+                answer = input("Allow? [y/N] ").strip().lower()
+            else:
+                answer = "y"
         except (KeyboardInterrupt, EOFError):
             console.print("[info]Skipped.[/info]")
             continue
