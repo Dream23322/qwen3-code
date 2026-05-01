@@ -92,6 +92,7 @@ from qwen3_code.commands import (  # noqa: E402, F401
     plan,
     council,
     learn,
+    navi,
     clear,
     check,
     stackview,

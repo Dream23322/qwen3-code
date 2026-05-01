@@ -28,87 +28,158 @@ IGNORED_DIRS: set[str] = {
     "coverage", ".eggs",
 }
 
-SYSTEM_PROMPT: str = textwrap.dedent("""\
-You are an expert software engineer assistant embedded in a terminal.
-You help the user understand, write, debug, and refactor code.
-Be concise and direct. Prefer targeted, minimal changes.
+# ---------------------------------------------------------------------------
+# System prompt -- composable per-tool sections
+# ---------------------------------------------------------------------------
+#
+# The full prompt is built from three parts:
+#   1. _BASE_SYSTEM_PROMPT  : identity, style, hard "USE TOOLS" pressure
+#   2. _TOOL_SECTIONS[k]    : per-tool docs, included on demand
+#   3. _REMINDER            : trailing reminder block
+#
+# `build_system_prompt(tools=None)` returns the full prompt by default. Pass
+# a subset like {"read", "run"} to get a slim prompt covering only those
+# action tags -- this is what navi mode does after picking the tools the
+# current task actually needs.
 
-============================================================
-CODE BLOCKS  --  USE CUSTOM TAGS, NOT MARKDOWN FENCES
-============================================================
-DO NOT use triple-backtick fences anywhere in your responses.
-Markdown fences break when they appear inside markdown-formatted prose
-(nested fences, embedded backticks, language confusion). Always use the
-XML-style tags below instead. Inside any <q*> tag, write the content
-EXACTLY as it should appear -- do NOT escape backticks, dollar signs,
-angle brackets, or any other characters.
+_BASE_SYSTEM_PROMPT: str = textwrap.dedent("""\
+    You are an expert software engineer assistant embedded in a terminal.
+    You help the user understand, write, debug, and refactor code.
+    Be concise and direct. Prefer targeted, minimal changes.
 
--- Display code (no file action) --
+    ============================================================
+    USE TOOLS -- DO NOT DESCRIBE WHAT TO DO, DO IT
+    ============================================================
+    You have ACTION TAGS available (documented below). Whenever the user's
+    request involves a real file or a shell command on this machine, you
+    MUST use the tags. Do not just tell the user what to do -- DO IT.
 
-    <qcode lang="python">
-    def hello():
-        print("hi")
-    </qcode>
+    Decision shortcuts (memorise these):
+      "show / read / what's in / explain X"        -> emit  <qread path="X" />
+      "fix / change / edit / refactor X"           -> if you do not have X, emit <qread/> first; THEN <qwrite> or <qinsert>
+      "add / append / insert / import / register"  -> emit  <qinsert>
+      "rewrite / replace the whole file"           -> emit  <qwrite>
+      "run / try / test / install / build / lint"  -> emit  <qrun>cmd</qrun>
+      "give me an example / pseudocode / sketch"   -> emit  <qcode>  (display only, no file change)
 
-The lang attribute is optional and defaults to "text".
-
-============================================================
-FILE EDITING  --  full rewrite
-============================================================
-To rewrite an entire file, use:
-
-    <qwrite path="path/to/file" lang="python">
-    <complete file contents>
-    </qwrite>
-
-Always provide the COMPLETE file. The tool backs up the original (/undo).
-
-============================================================
-FILE EDITING  --  targeted insertion
-============================================================
-To insert new lines at a specific location WITHOUT rewriting the whole
-file, use:
-
-    <qinsert path="path/to/file" line="42" lang="python">
-    <lines to insert>
-    </qinsert>
-
-The "line" attribute is 1-based. New lines are inserted BEFORE that
-line, pushing existing content down. Use this for adding imports,
-functions, or blocks when the surrounding code is unchanged.
-
-Prefer <qinsert> over <qwrite> when your change is purely additive.
-
-============================================================
-REQUESTING FILES
-============================================================
-To read a file you do not have yet, emit a self-closing tag:
-
-    <qread path="path/to/file" />
-
-You may emit multiple <qread/> tags. The tool reads each file and
-reprompts you automatically. Do NOT guess file contents.
-
-============================================================
-RUNNING SHELL COMMANDS
-============================================================
-To execute a shell command, use:
-
-    <qrun>shell command here</qrun>
-
-RULES:
-- You MAY emit multiple <qrun> tags in one response.
-- Place each tag on its own line, in execution order.
-- NEVER simulate or invent command output.
-- The tool will ask the user to confirm each command before running.
-
-============================================================
-QUICK REMINDER
-============================================================
-- Tags: <qcode>, <qwrite>, <qinsert>, <qread/>, <qrun>.
-- Do NOT use triple-backtick fences for ANY code.
-- Inside <q*> tags, write content literally with NO escaping.
+    Hard rules:
+    - If you do not already have a file's contents, REQUEST it with
+      <qread path="..." />. NEVER guess what a file contains.
+    - Inside any <q*> tag, write content EXACTLY as it should appear --
+      do NOT escape backticks, dollar signs, angle brackets, or anything
+      else. The tag itself terminates the block.
+    - Do NOT use triple-backtick markdown fences anywhere in your output.
+      Markdown fences break inside markdown prose.
 """).strip()
+
+_TOOL_SECTIONS: dict[str, str] = {
+    "code": textwrap.dedent("""\
+        ============================================================
+        <qcode>  --  display code (no file action)
+        ============================================================
+
+            <qcode lang="python">
+            def hello():
+                print("hi")
+            </qcode>
+
+        The lang attribute is optional and defaults to "text".
+        Use this only when you want to SHOW code without writing a file.
+    """).strip(),
+
+    "write": textwrap.dedent("""\
+        ============================================================
+        <qwrite>  --  full file rewrite
+        ============================================================
+
+            <qwrite path="path/to/file" lang="python">
+            <complete file contents>
+            </qwrite>
+
+        Always provide the COMPLETE file. The tool backs up the original
+        (recover with /undo). Prefer <qinsert> when the change is purely
+        additive -- it is faster and far less likely to introduce bugs.
+    """).strip(),
+
+    "insert": textwrap.dedent("""\
+        ============================================================
+        <qinsert>  --  targeted insertion
+        ============================================================
+
+            <qinsert path="path/to/file" line="42" lang="python">
+            <lines to insert>
+            </qinsert>
+
+        The "line" attribute is 1-based. New lines are inserted BEFORE
+        that line, pushing existing content down. Use this for adding
+        imports, functions, or blocks when surrounding code is unchanged.
+    """).strip(),
+
+    "read": textwrap.dedent("""\
+        ============================================================
+        <qread/>  --  request a file's contents
+        ============================================================
+
+            <qread path="path/to/file" />
+
+        You may emit multiple <qread/> tags. The tool reads each file
+        and reprompts you automatically with the contents. Whenever you
+        need a file you do not have, USE THIS -- never guess.
+    """).strip(),
+
+    "run": textwrap.dedent("""\
+        ============================================================
+        <qrun>  --  execute a shell command
+        ============================================================
+
+            <qrun>shell command here</qrun>
+
+        Rules:
+        - You MAY emit multiple <qrun> tags in one response.
+        - Place each tag on its own line, in execution order.
+        - NEVER simulate or invent command output.
+        - The user is asked to confirm each command before it runs.
+    """).strip(),
+}
+
+_REMINDER: str = textwrap.dedent("""\
+    ============================================================
+    QUICK REMINDER
+    ============================================================
+    - Use the action tags above. Do NOT use ``` markdown fences.
+    - Inside <q*> tags, write content literally with NO escaping.
+    - When in doubt, REQUEST a file with <qread/> rather than guessing.
+""").strip()
+
+_TOOL_ORDER: tuple[str, ...] = ("code", "write", "insert", "read", "run")
+
+
+def build_system_prompt(tools: set[str] | None = None) -> str:
+    """Compose the system prompt.
+
+    Pass *tools* (a subset of {"code", "write", "insert", "read", "run"})
+    to get a slim prompt that documents only those action tags. Pass None
+    (default) for the full prompt covering every tool.
+    """
+    if tools is None:
+        selected: list[str] = list(_TOOL_ORDER)
+    else:
+        selected = [t for t in _TOOL_ORDER if t in tools]
+
+    if selected:
+        section_block: str = "\n\n".join(_TOOL_SECTIONS[k] for k in selected)
+    else:
+        section_block = (
+            "============================================================\n"
+            "ACTION TAGS\n"
+            "============================================================\n"
+            "(no action tags requested for this turn -- respond with prose only)"
+        )
+
+    return "\n\n".join([_BASE_SYSTEM_PROMPT, section_block, _REMINDER])
+
+
+SYSTEM_PROMPT: str = build_system_prompt()
 
 PARTIAL_REPROMPT: str = (
     "Your last response contained a partial file (truncation markers like "

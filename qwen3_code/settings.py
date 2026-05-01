@@ -18,6 +18,7 @@ DEFAULT_SETTINGS: dict = {
     "insert_verify":          True,
     "learn_mode":             False,
     "safe_mode":              True,
+    "navi":                   False,
 }
 
 SETTINGS_HELP: dict[str, str] = {
@@ -29,6 +30,7 @@ SETTINGS_HELP: dict[str, str] = {
     "insert_verify":          "true/false  \u2014 show syntax check + diff preview before applying INSERT markers",
     "learn_mode":             "true/false  \u2014 beginner tutorial mode: AI explains concepts step-by-step (toggle with /learn)",
     "safe_mode":              "true/false  \u2014 disable user verification and other security measures (not recommended)",
+    "navi":                   "true/false  \u2014 router mode: AI summarises the task and picks which action tags it needs, then runs with a slim prompt (toggle with /navi)",
 }
 
 
@@ -63,6 +65,7 @@ def _assistant_name() -> str:  return CFG["assistant_name"]
 def _context_window() -> int:  return int(CFG.get("context_window", 128_000))
 def _learn_mode()     -> bool: return bool(CFG.get("learn_mode", False))
 def _safe_mode()      -> bool: return bool(CFG.get("safe_mode", True))
+def _navi_mode()      -> bool: return bool(CFG.get("navi", False))
 
 
 # ---------------------------------------------------------------------------

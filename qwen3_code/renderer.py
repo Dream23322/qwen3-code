@@ -14,12 +14,16 @@ from rich.syntax import Syntax
 from rich.text import Text
 
 from qwen3_code.theme import console, SAKURA, SAKURA_DEEP, SAKURA_DARK, SAKURA_MUTED
-from qwen3_code.settings import _model, _assistant_name, _learn_mode
-from qwen3_code.utils import _phys_rows, STREAM_MAX_LINES, PARTIAL_REPROMPT, resolve_path, read_file
+from qwen3_code.settings import _model, _assistant_name, _learn_mode, _navi_mode
+from qwen3_code.utils import (
+    _phys_rows, STREAM_MAX_LINES, PARTIAL_REPROMPT,
+    resolve_path, read_file, build_system_prompt, spinning_dots,
+)
 from qwen3_code.partial import (
     reply_has_partial_write, apply_file_writes, apply_file_inserts, apply_command_runs,
     has_read_requests, collect_read_requests, has_inserts, parse_attrs,
 )
+from qwen3_code.navi import select_tools_for_task
 
 # ---------------------------------------------------------------------------
 # Learn-mode system message
@@ -286,6 +290,48 @@ def _effective_messages(messages: list[dict]) -> list[dict]:
     return [_LEARN_SYSTEM_MSG] + messages
 
 
+# ---------------------------------------------------------------------------
+# Navi: per-turn slim system prompt
+# ---------------------------------------------------------------------------
+
+def _with_navi_system(messages: list[dict], slim: str | None) -> list[dict]:
+    """If *slim* is set, drop existing system messages and prepend the slim one.
+
+    This builds a NEW list -- the caller's `messages` is not mutated, so the
+    persisted session keeps the full system prompt even after navi runs.
+    """
+    if slim is None:
+        return messages
+    non_system: list[dict] = [m for m in messages if m.get("role") != "system"]
+    return [{"role": "system", "content": slim}] + non_system
+
+
+def _compute_navi_system(messages: list[dict]) -> str | None:
+    """Run the router once for the latest user message and return a slim prompt.
+
+    Returns None if there's no user message to route on.
+    """
+    user_msg: str = ""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            user_msg = m.get("content", "")
+            break
+    if not user_msg:
+        return None
+
+    with spinning_dots("navi: routing"):
+        summary, tools = select_tools_for_task(user_msg)
+
+    tools_label: str = ", ".join(sorted(tools)) if tools else "(none)"
+    console.print(Panel(
+        f"[bold]Task:[/bold] {summary}\n"
+        f"[bold]Tools:[/bold] {tools_label}",
+        title="navi",
+        border_style=SAKURA_DEEP,
+    ))
+    return build_system_prompt(tools)
+
+
 def stream_response(messages: list[dict], cwd: str = "") -> str:
     """Stream a response from the model.
 
@@ -297,9 +343,15 @@ def stream_response(messages: list[dict], cwd: str = "") -> str:
     - <qinsert path="..." line="N"> markers (and legacy <!-- INSERT: --> markers)
     - <qrun>cmd</qrun> markers (and legacy <!-- RUN: --> markers)
     - Learn mode (prepends beginner-friendly system message)
+    - Navi mode (replaces full system prompt with a slim per-turn one)
     """
-    effective = _effective_messages(messages)
-    full_reply, user_cancelled = _do_stream(effective)
+    # ---- Navi: pick the slim system prompt for THIS turn -----------------
+    navi_system: str | None = _compute_navi_system(messages) if _navi_mode() else None
+
+    def _effective(msgs: list[dict]) -> list[dict]:
+        return _effective_messages(_with_navi_system(msgs, navi_system))
+
+    full_reply, user_cancelled = _do_stream(_effective(messages))
 
     if not full_reply:
         if user_cancelled:
@@ -317,7 +369,7 @@ def stream_response(messages: list[dict], cwd: str = "") -> str:
                             title="Partial write", border_style=SAKURA_DARK))
         messages.append({"role": "assistant", "content": full_reply})
         messages.append({"role": "user",      "content": PARTIAL_REPROMPT})
-        rr, rc_cancelled = _do_stream(_effective_messages(messages), "retrying...")
+        rr, rc_cancelled = _do_stream(_effective(messages), "retrying...")
         messages.pop()
         messages.pop()
         if rc_cancelled:
@@ -353,7 +405,7 @@ def stream_response(messages: list[dict], cwd: str = "") -> str:
             "role": "user",
             "content": "Files you requested:\n\n" + "\n\n".join(file_blocks),
         })
-        new_reply, was_cancelled = _do_stream(_effective_messages(messages), "reading files...")
+        new_reply, was_cancelled = _do_stream(_effective(messages), "reading files...")
         if was_cancelled or not new_reply:
             if was_cancelled:
                 console.print("[info]Cancelled.[/info]")
