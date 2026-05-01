@@ -387,7 +387,6 @@ def apply_command_runs(reply: str, cwd: str, messages: list[dict]) -> None:
             title="Permission required", border_style=SAKURA_DARK,
         ))
         try:
-            answer
             if _safe_mode():
                 answer = input("Allow? [y/N] ").strip().lower()
             else:
